@@ -1,66 +1,142 @@
-// Wrapper fino sobre o ffmpeg para as duas operações que a etapa de
-// processamento precisa: (1) transformar imagem + música em vídeo e
-// (2) normalizar o volume do áudio dentro de uma faixa agradável.
 'use strict';
 
 const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
+const ffprobePath = require('ffprobe-static').path;
 
-// Alvo de volume: -16 LUFS integrado é o padrão usado por serviços de
-// streaming (Spotify, YouTube) para conteúdo "confortável de ouvir" sem
-// picos estourados nem trechos baixos demais. TP=-1.5 evita clipping de
-// pico; LRA=11 evita que o normalizador achate demais a dinâmica.
-// Isso funciona como a "régua" pedida: o que está mais baixo sobe até
-// essa faixa, o que está mais alto desce até essa faixa.
 const LOUDNESS_TARGET = 'loudnorm=I=-16:TP=-1.5:LRA=11';
+const SCALE_FILTER =
+  "scale=w='min(1920,iw)':h='min(1080,ih)':" +
+  'force_original_aspect_ratio=decrease:force_divisible_by=2';
 
-function run(args) {
+const VIDEO_ARGS = [
+  '-c:v', 'libx264',
+  '-preset', process.env.FFMPEG_PRESET || 'veryfast',
+  '-crf', process.env.FFMPEG_CRF || '22',
+  '-profile:v', 'main',
+  '-level:v', '4.0',
+  '-pix_fmt', 'yuv420p',
+  '-r', '30',
+  '-maxrate', process.env.FFMPEG_MAXRATE || '5M',
+  '-bufsize', process.env.FFMPEG_BUFSIZE || '10M',
+  '-movflags', '+faststart'
+];
+
+const AUDIO_ARGS = [
+  '-c:a', 'aac',
+  '-b:a', process.env.FFMPEG_AUDIO_BITRATE || '160k',
+  '-ac', '2',
+  '-ar', '48000'
+];
+
+function run(binary, args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(ffmpegPath, args);
+    const proc = spawn(binary, args);
+    let stdout = '';
     let stderr = '';
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    proc.stdout.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr.on('data', (data) => { stderr += data.toString(); });
     proc.on('error', reject);
     proc.on('close', (code) => {
-      if (code === 0) { resolve(); }
-      else { reject(new Error('ffmpeg falhou (código ' + code + '): ' + stderr.slice(-1500))); }
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(
+          'Processamento de mídia falhou (código ' + code + '): ' +
+          stderr.slice(-2500)
+        ));
+      }
     });
   });
 }
 
-// Imagem parada + música (opcional) -> vídeo mp4 de duração fixa.
+async function probe(filePath) {
+  const result = await run(ffprobePath, [
+    '-v', 'error',
+    '-show_entries', 'format=duration,size',
+    '-show_entries', 'stream=codec_type,codec_name,profile,width,height,pix_fmt,r_frame_rate',
+    '-of', 'json',
+    filePath
+  ]);
+  const data = JSON.parse(result.stdout);
+  const streams = data.streams || [];
+  const video = streams.find((stream) => stream.codec_type === 'video') || null;
+  const audio = streams.find((stream) => stream.codec_type === 'audio') || null;
+  return {
+    durationSeconds: Number(data.format && data.format.duration) || null,
+    sizeBytes: Number(data.format && data.format.size) || null,
+    video,
+    audio
+  };
+}
+
+function videoOutputArgs() {
+  return ['-vf', SCALE_FILTER].concat(VIDEO_ARGS);
+}
+
 async function imageToVideo(imagePath, musicPath, durationSeconds, outPath) {
-  const args = ['-y', '-loop', '1', '-i', imagePath];
-  if (musicPath) { args.push('-stream_loop', '-1', '-i', musicPath); }
-  args.push(
-    '-t', String(durationSeconds),
-    '-c:v', 'libx264', '-tune', 'stillimage', '-pix_fmt', 'yuv420p'
-  );
+  const args = [
+    '-y',
+    '-loop', '1',
+    '-framerate', '30',
+    '-i', imagePath
+  ];
+
   if (musicPath) {
-    args.push('-af', LOUDNESS_TARGET, '-shortest');
+    args.push('-stream_loop', '-1', '-i', musicPath);
+  }
+
+  args.push('-t', String(durationSeconds));
+  args.push.apply(args, videoOutputArgs());
+
+  if (musicPath) {
+    args.push('-map', '0:v:0', '-map', '1:a:0');
+    args.push('-af', LOUDNESS_TARGET);
+    args.push.apply(args, AUDIO_ARGS);
+    args.push('-shortest');
   } else {
     args.push('-an');
   }
+
   args.push(outPath);
-  await run(args);
+  await run(ffmpegPath, args);
+  return probe(outPath);
 }
 
-// Vídeo original + música nova no lugar do áudio original (silenciado).
-async function replaceVideoAudioWithMusic(videoPath, musicPath, outPath) {
-  await run([
-    '-y', '-i', videoPath, '-stream_loop', '-1', '-i', musicPath,
-    '-map', '0:v:0', '-map', '1:a:0',
-    '-c:v', 'copy', '-af', LOUDNESS_TARGET, '-shortest', outPath
-  ]);
+async function transcodeVideo(videoPath, options, outPath) {
+  const opts = options || {};
+  const inputInfo = await probe(videoPath);
+  const args = ['-y', '-i', videoPath];
+
+  if (opts.musicPath) {
+    args.push('-stream_loop', '-1', '-i', opts.musicPath);
+  }
+
+  args.push('-map', '0:v:0');
+  args.push.apply(args, videoOutputArgs());
+
+  if (opts.keepOriginalAudio && inputInfo.audio) {
+    args.push('-map', '0:a:0');
+    args.push('-af', LOUDNESS_TARGET);
+    args.push.apply(args, AUDIO_ARGS);
+  } else if (opts.musicPath) {
+    args.push('-map', '1:a:0');
+    args.push('-af', LOUDNESS_TARGET);
+    args.push.apply(args, AUDIO_ARGS);
+    args.push('-shortest');
+  } else {
+    args.push('-an');
+  }
+
+  args.push(outPath);
+  await run(ffmpegPath, args);
+  return probe(outPath);
 }
 
-// Vídeo original silenciado, sem música nenhuma.
-async function muteVideo(videoPath, outPath) {
-  await run(['-y', '-i', videoPath, '-c:v', 'copy', '-an', outPath]);
-}
-
-// Vídeo original mantendo o áudio, só normalizando o volume.
-async function normalizeVideoAudio(videoPath, outPath) {
-  await run(['-y', '-i', videoPath, '-c:v', 'copy', '-af', LOUDNESS_TARGET, outPath]);
-}
-
-module.exports = { imageToVideo, replaceVideoAudioWithMusic, muteVideo, normalizeVideoAudio };
+module.exports = {
+  imageToVideo,
+  transcodeVideo,
+  probe,
+  constants: { SCALE_FILTER, VIDEO_ARGS, AUDIO_ARGS }
+};
