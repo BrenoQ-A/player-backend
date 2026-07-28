@@ -88,10 +88,6 @@ function contentTypeForAudio(extension) {
   return map[extension] || 'application/octet-stream';
 }
 
-function asBoolean(value) {
-  return value === true || value === 'true';
-}
-
 function clampNumber(value, fallback, min, max) {
   const number = Number(value);
   if (!Number.isFinite(number)) { return fallback; }
@@ -315,6 +311,75 @@ function createApp() {
     });
   }));
 
+  async function saveVideoOutput(originalFile, outputPath, outputInfo, uploadedBy) {
+    const stat = await fs.stat(outputPath);
+    if (stat.size > MAX_OUTPUT_MB * 1024 * 1024) {
+      throw new Error(
+        'O vídeo processado ficou com ' +
+        Math.ceil(stat.size / 1024 / 1024) +
+        ' MB, acima do limite configurado de ' + MAX_OUTPUT_MB + ' MB.'
+      );
+    }
+
+    const displayName = safeBaseName(originalFile.originalname) + '.mp4';
+    const key = 'media/' + crypto.randomUUID() + '-' + displayName;
+    await storage.putFile(
+      key,
+      outputPath,
+      'video/mp4',
+      'public, max-age=3600'
+    );
+
+    try {
+      return await catalog.addMedia({
+        name: displayName,
+        originalName: originalFile.originalname,
+        key,
+        type: 'video',
+        sizeBytes: stat.size,
+        durationSeconds: outputInfo.durationSeconds,
+        videoCodec: outputInfo.video && outputInfo.video.codec_name,
+        audioCodec: outputInfo.audio && outputInfo.audio.codec_name,
+        uploadedBy
+      });
+    } catch (error) {
+      await storage.deleteObject(key).catch(() => {});
+      throw error;
+    }
+  }
+
+  app.post(
+    '/api/media/upload',
+    requireAuth,
+    upload.single('file'),
+    asyncRoute(async (req, res) => {
+      if (!req.file) {
+        return res.status(400).json({ error: 'Selecione um vídeo.' });
+      }
+
+      try {
+        const extension = extOf(req.file.originalname);
+        if (!VIDEO_EXT.includes(extension)) {
+          return res.status(400).json({
+            error: 'Formato não suportado. Selecione um arquivo de vídeo.'
+          });
+        }
+
+        const media = await withTempDir(async (dir) => {
+          const outputPath = path.join(dir, 'output.mp4');
+          const outputInfo = await ffmpeg.transcodeVideo(req.file.path, {
+            keepOriginalAudio: true
+          }, outputPath);
+          return saveVideoOutput(req.file, outputPath, outputInfo, req.gpid);
+        });
+
+        res.json({ ok: true, media, name: media.name });
+      } finally {
+        await removeUploadedFiles(req.file);
+      }
+    })
+  );
+
   app.post('/api/media/reorder', requireAuth, asyncRoute(async (req, res) => {
     const order = Array.isArray(req.body && req.body.order) ? req.body.order : [];
     const playlist = await catalog.reorderMedia(order);
@@ -423,23 +488,20 @@ function createApp() {
 
   async function processMedia(req, res, detailed) {
     if (!req.file) {
-      return res.status(400).json({ error: 'Selecione um arquivo.' });
+      return res.status(400).json({ error: 'Selecione uma imagem.' });
     }
 
     try {
       const extension = extOf(req.file.originalname);
-      const isImage = IMAGE_EXT.includes(extension);
-      const isVideo = VIDEO_EXT.includes(extension);
-      if (!isImage && !isVideo) {
+      if (!IMAGE_EXT.includes(extension)) {
         return res.status(400).json({
-          error: 'Formato não suportado. Use JPG/PNG ou um arquivo de vídeo.'
+          error: 'O conversor aceita somente imagens JPG ou PNG.'
         });
       }
 
       const media = await withTempDir(async (dir) => {
         const outputPath = path.join(dir, 'output.mp4');
         let music = null;
-        let keepOriginalAudio = false;
         let durationSeconds = 60;
 
         if (detailed) {
@@ -448,62 +510,18 @@ function createApp() {
           if (req.body.musicId && !music) {
             throw new Error('A música selecionada não existe mais na biblioteca.');
           }
-          keepOriginalAudio = asBoolean(req.body.keepOriginalAudio);
         } else {
           music = await pickRandomMusic();
         }
 
         const musicPath = await downloadMusicToTemp(music, dir);
-        let outputInfo;
-
-        if (isImage) {
-          outputInfo = await ffmpeg.imageToVideo(
-            req.file.path,
-            musicPath,
-            durationSeconds,
-            outputPath
-          );
-        } else {
-          outputInfo = await ffmpeg.transcodeVideo(req.file.path, {
-            musicPath,
-            keepOriginalAudio: detailed && keepOriginalAudio
-          }, outputPath);
-        }
-
-        const stat = await fs.stat(outputPath);
-        if (stat.size > MAX_OUTPUT_MB * 1024 * 1024) {
-          throw new Error(
-            'O vídeo processado ficou com ' +
-            Math.ceil(stat.size / 1024 / 1024) +
-            ' MB, acima do limite configurado de ' + MAX_OUTPUT_MB + ' MB.'
-          );
-        }
-
-        const displayName = safeBaseName(req.file.originalname) + '.mp4';
-        const key = 'media/' + crypto.randomUUID() + '-' + displayName;
-        await storage.putFile(
-          key,
-          outputPath,
-          'video/mp4',
-          'public, max-age=3600'
+        const outputInfo = await ffmpeg.imageToVideo(
+          req.file.path,
+          musicPath,
+          durationSeconds,
+          outputPath
         );
-
-        try {
-          return await catalog.addMedia({
-            name: displayName,
-            originalName: req.file.originalname,
-            key,
-            type: 'video',
-            sizeBytes: stat.size,
-            durationSeconds: outputInfo.durationSeconds,
-            videoCodec: outputInfo.video && outputInfo.video.codec_name,
-            audioCodec: outputInfo.audio && outputInfo.audio.codec_name,
-            uploadedBy: req.gpid
-          });
-        } catch (error) {
-          await storage.deleteObject(key).catch(() => {});
-          throw error;
-        }
+        return saveVideoOutput(req.file, outputPath, outputInfo, req.gpid);
       });
 
       res.json({ ok: true, media, name: media.name });
