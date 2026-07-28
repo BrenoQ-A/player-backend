@@ -5,6 +5,8 @@ const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
 
 const LOUDNESS_TARGET = 'loudnorm=I=-16:TP=-1.5:LRA=11';
+const FFMPEG_THREADS = process.env.FFMPEG_THREADS || '1';
+const MAX_CAPTURE_CHARS = 20000;
 const SCALE_FILTER =
   "scale=w='min(1920,iw)':h='min(1080,ih)':" +
   'force_original_aspect_ratio=decrease:force_divisible_by=2';
@@ -16,6 +18,7 @@ const VIDEO_ARGS = [
   '-profile:v', 'main',
   '-level:v', '4.0',
   '-pix_fmt', 'yuv420p',
+  '-threads', FFMPEG_THREADS,
   '-r', '30',
   '-maxrate', process.env.FFMPEG_MAXRATE || '5M',
   '-bufsize', process.env.FFMPEG_BUFSIZE || '10M',
@@ -31,12 +34,19 @@ const AUDIO_ARGS = [
 
 function run(binary, args) {
   return new Promise((resolve, reject) => {
-    const proc = spawn(binary, args);
+    const commandArgs = binary === ffmpegPath
+      ? ['-hide_banner', '-loglevel', 'error'].concat(args)
+      : args;
+    const proc = spawn(binary, commandArgs);
     let stdout = '';
     let stderr = '';
 
-    proc.stdout.on('data', (data) => { stdout += data.toString(); });
-    proc.stderr.on('data', (data) => { stderr += data.toString(); });
+    proc.stdout.on('data', (data) => {
+      stdout = (stdout + data.toString()).slice(-MAX_CAPTURE_CHARS);
+    });
+    proc.stderr.on('data', (data) => {
+      stderr = (stderr + data.toString()).slice(-MAX_CAPTURE_CHARS);
+    });
     proc.on('error', reject);
     proc.on('close', (code) => {
       if (code === 0) {
@@ -72,7 +82,7 @@ async function probe(filePath) {
 }
 
 function videoOutputArgs() {
-  return ['-vf', SCALE_FILTER].concat(VIDEO_ARGS);
+  return ['-filter_threads', FFMPEG_THREADS, '-vf', SCALE_FILTER].concat(VIDEO_ARGS);
 }
 
 async function imageToVideo(imagePath, musicPath, durationSeconds, outPath) {
