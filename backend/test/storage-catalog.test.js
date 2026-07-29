@@ -21,6 +21,10 @@ test('armazenamento local e catálogo mantêm playlist ordenada', async () => {
 
     await storage.putBuffer('media/a.mp4', Buffer.from('a'), 'video/mp4');
     await storage.putBuffer('media/b.mp4', Buffer.from('b'), 'video/mp4');
+    const downloaded = path.join(dir, 'downloaded.mp4');
+    assert.equal(await storage.getFile('media/a.mp4', downloaded), true);
+    assert.equal(await fs.readFile(downloaded, 'utf8'), 'a');
+    assert.equal(await storage.getFile('media/missing.mp4', downloaded), false);
 
     const first = await catalog.addMedia({
       name: 'A.mp4',
