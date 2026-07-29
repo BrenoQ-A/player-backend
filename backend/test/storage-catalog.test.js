@@ -25,6 +25,17 @@ test('armazenamento local e catálogo mantêm playlist ordenada', async () => {
     assert.equal(await storage.getFile('media/a.mp4', downloaded), true);
     assert.equal(await fs.readFile(downloaded, 'utf8'), 'a');
     assert.equal(await storage.getFile('media/missing.mp4', downloaded), false);
+    const uploaded = path.join(dir, 'uploaded.mp4');
+    await fs.writeFile(uploaded, 'streamed');
+    const uploadProgress = [];
+    await storage.putFile(
+      'media/streamed.mp4',
+      uploaded,
+      'video/mp4',
+      'no-cache',
+      (progress) => uploadProgress.push(progress.percent)
+    );
+    assert.deepEqual(uploadProgress, [100]);
 
     const first = await catalog.addMedia({
       name: 'A.mp4',
