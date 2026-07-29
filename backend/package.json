@@ -6,7 +6,7 @@
   "engines": { "node": ">=18" },
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check storage.js && node --check catalog.js && node --check ffmpeg.js",
+    "check": "node --check server.js && node --check storage.js && node --check catalog.js && node --check ffmpeg.js && node --check processing-queue.js",
     "test": "node --test"
   },
   "dependencies": {
