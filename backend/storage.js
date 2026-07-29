@@ -3,6 +3,7 @@
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
+const { pipeline } = require('stream/promises');
 const {
   S3Client,
   GetObjectCommand,
@@ -96,8 +97,19 @@ function createStorage(options) {
       return;
     }
 
+    const uploadConcurrency = Math.max(
+      1,
+      Number(process.env.STORAGE_UPLOAD_CONCURRENCY || 1)
+    );
+    const uploadPartSize = Math.max(
+      5,
+      Number(process.env.STORAGE_UPLOAD_PART_MB || 8)
+    ) * 1024 * 1024;
     const upload = new Upload({
       client: s3,
+      queueSize: uploadConcurrency,
+      partSize: uploadPartSize,
+      leavePartsOnError: false,
       params: {
         Bucket: bucket,
         Key: key,
@@ -107,6 +119,30 @@ function createStorage(options) {
       }
     });
     await upload.done();
+  }
+
+  async function getFile(key, filePath) {
+    assertSafeKey(key);
+    if (driver === 'local') {
+      try {
+        await fsp.copyFile(localPath(key), filePath);
+        return true;
+      } catch (error) {
+        if (error.code === 'ENOENT') { return false; }
+        throw error;
+      }
+    }
+
+    try {
+      const result = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+      await pipeline(result.Body, fs.createWriteStream(filePath));
+      return true;
+    } catch (error) {
+      await fsp.unlink(filePath).catch(() => {});
+      const status = error.$metadata && error.$metadata.httpStatusCode;
+      if (status === 404 || error.name === 'NoSuchKey') { return false; }
+      throw error;
+    }
   }
 
   async function putBuffer(key, buffer, contentType, cacheControl) {
@@ -180,6 +216,7 @@ function createStorage(options) {
     publicBaseUrl,
     putFile,
     putBuffer,
+    getFile,
     getBuffer,
     deleteObject,
     getJson,

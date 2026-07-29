@@ -51,8 +51,8 @@ test('converte vídeo incompatível para H.264/AAC da Samsung 2015', async () =>
     assert.equal(info.video.codec_name, 'h264');
     assert.equal(info.video.pix_fmt, 'yuv420p');
     assert.equal(info.audio.codec_name, 'aac');
-    assert.ok(info.video.width <= 1920);
-    assert.ok(info.video.height <= 1080);
+    assert.ok(info.video.width <= media.constants.MAX_WIDTH);
+    assert.ok(info.video.height <= media.constants.MAX_HEIGHT);
     assert.ok(info.durationSeconds > 0);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
@@ -89,6 +89,81 @@ test('reconhece MP4 já compatível e com faststart', async () => {
   }
 });
 
+test('reposiciona faststart sem recodificar vídeo compatível', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'player-ffmpeg-test-'));
+  const input = path.join(dir, 'entrada-sem-faststart.mp4');
+  const output = path.join(dir, 'saida-remux.mp4');
+
+  try {
+    await run([
+      '-y',
+      '-f', 'lavfi',
+      '-i', 'testsrc=size=640x360:rate=30',
+      '-f', 'lavfi',
+      '-i', 'sine=frequency=1000:sample_rate=44100',
+      '-t', '1',
+      '-c:v', 'libx264',
+      '-profile:v', 'main',
+      '-level:v', '4.0',
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-ac', '2',
+      input
+    ]);
+
+    const inputInfo = await media.probe(input);
+    assert.equal(media.isSamsungCompatible(inputInfo), true);
+    assert.equal(await media.hasFastStart(input), false);
+
+    const outputInfo = await media.remuxVideo(input, { inputInfo }, output);
+    assert.equal(outputInfo.video.codec_name, inputInfo.video.codec_name);
+    assert.equal(outputInfo.video.width, inputInfo.video.width);
+    assert.equal(outputInfo.video.height, inputInfo.video.height);
+    assert.equal(outputInfo.audio.codec_name, 'aac');
+    assert.equal(await media.hasFastStart(output), true);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('mantém H.264 e converte somente áudio incompatível', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'player-ffmpeg-test-'));
+  const input = path.join(dir, 'entrada-audio-incompativel.mkv');
+  const output = path.join(dir, 'saida-audio-aac.mp4');
+
+  try {
+    await run([
+      '-y',
+      '-f', 'lavfi',
+      '-i', 'testsrc=size=640x360:rate=24',
+      '-f', 'lavfi',
+      '-i', 'sine=frequency=1000:sample_rate=44100',
+      '-t', '1',
+      '-c:v', 'libx264',
+      '-profile:v', 'main',
+      '-level:v', '4.0',
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'pcm_s16le',
+      input
+    ]);
+
+    const inputInfo = await media.probe(input);
+    assert.equal(media.isSamsungVideoCompatible(inputInfo), true);
+    assert.equal(media.isSamsungAudioCompatible(inputInfo), false);
+
+    const outputInfo = await media.remuxVideo(input, {
+      inputInfo,
+      transcodeAudio: true
+    }, output);
+    assert.equal(outputInfo.video.codec_name, 'h264');
+    assert.equal(outputInfo.audio.codec_name, 'aac');
+    assert.equal(media.isSamsungCompatible(outputInfo), true);
+    assert.equal(await media.hasFastStart(output), true);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('transforma imagem em vídeo H.264 de duração configurada', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'player-ffmpeg-test-'));
   const input = path.join(dir, 'entrada.png');
@@ -110,6 +185,9 @@ test('transforma imagem em vídeo H.264 de duração configurada', async () => {
     assert.ok(info.durationSeconds >= 0.9);
     assert.equal(info.video.width % 2, 0);
     assert.equal(info.video.height % 2, 0);
+    const rateParts = info.video.avg_frame_rate.split('/');
+    const frameRate = Number(rateParts[0]) / Number(rateParts[1] || 1);
+    assert.ok(frameRate <= Number(media.constants.IMAGE_VIDEO_FPS));
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

@@ -44,3 +44,27 @@ services:
         value: "500"
       - key: MAX_OUTPUT_MB
         value: "1000"
+      - key: MAX_PROCESSING_QUEUE
+        value: "4"
+      - key: FFMPEG_PRESET
+        value: ultrafast
+      - key: FFMPEG_CRF
+        value: "23"
+      - key: FFMPEG_MAX_WIDTH
+        value: "1280"
+      - key: FFMPEG_MAX_HEIGHT
+        value: "720"
+      - key: FFMPEG_VIDEO_FPS
+        value: "30"
+      - key: IMAGE_VIDEO_FPS
+        value: "15"
+      - key: FFMPEG_MAXRATE
+        value: 3M
+      - key: FFMPEG_BUFSIZE
+        value: 6M
+      - key: FFMPEG_THREADS
+        value: "1"
+      - key: STORAGE_UPLOAD_CONCURRENCY
+        value: "1"
+      - key: STORAGE_UPLOAD_PART_MB
+        value: "8"

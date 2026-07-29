@@ -17,6 +17,7 @@ const gh = require('./github');
 const ffmpeg = require('./ffmpeg');
 const { createStorage } = require('./storage');
 const { createCatalog } = require('./catalog');
+const { createProcessingQueue } = require('./processing-queue');
 
 const {
   GITHUB_TOKEN,
@@ -30,6 +31,7 @@ const {
 
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 500);
 const MAX_OUTPUT_MB = Number(process.env.MAX_OUTPUT_MB || 1000);
+const MAX_PROCESSING_QUEUE = Number(process.env.MAX_PROCESSING_QUEUE || 4);
 const SESSION_DAYS = 30;
 const USERS_PATH = 'users.json';
 const IMAGE_EXT = ['jpg', 'jpeg', 'png'];
@@ -193,6 +195,7 @@ function createApp() {
 
   const storage = createStorage();
   const catalog = createCatalog(storage);
+  const processingQueue = createProcessingQueue({ maxPending: MAX_PROCESSING_QUEUE });
   const app = express();
   const uploadDir = path.join(os.tmpdir(), 'player-uploads');
   const allowedOrigins = ALLOWED_ORIGIN.split(',').map((item) => item.trim()).filter(Boolean);
@@ -247,6 +250,7 @@ function createApp() {
       ok: true,
       service: 'player-sinalizacao-backend',
       storage: storage.driver,
+      processing: processingQueue.stats(),
       timestamp: new Date().toISOString()
     });
   });
@@ -366,27 +370,44 @@ function createApp() {
         }
 
         const inputInfo = await ffmpeg.probe(req.file.path);
-        const publishOriginal =
-          extension === 'mp4' &&
-          ffmpeg.isSamsungCompatible(inputInfo) &&
-          await ffmpeg.hasFastStart(req.file.path);
+        const isMp4 = extension === 'mp4';
+        const videoCompatible = ffmpeg.isSamsungVideoCompatible(inputInfo);
+        const audioCompatible = ffmpeg.isSamsungAudioCompatible(inputInfo);
+        const fastStart =
+          isMp4 && videoCompatible && await ffmpeg.hasFastStart(req.file.path);
+        let processing = 'direct';
+        let media;
 
-        const media = publishOriginal
-          ? await saveVideoOutput(req.file, req.file.path, inputInfo, req.gpid)
-          : await withTempDir(async (dir) => {
-              const outputPath = path.join(dir, 'output.mp4');
-              const outputInfo = await ffmpeg.transcodeVideo(req.file.path, {
+        if (isMp4 && videoCompatible && audioCompatible && fastStart) {
+          media = await saveVideoOutput(req.file, req.file.path, inputInfo, req.gpid);
+        } else {
+          media = await processingQueue.run(() => withTempDir(async (dir) => {
+            const outputPath = path.join(dir, 'output.mp4');
+            let outputInfo;
+
+            if (videoCompatible) {
+              processing = audioCompatible ? 'remuxed' : 'audio-transcoded';
+              outputInfo = await ffmpeg.remuxVideo(req.file.path, {
+                inputInfo,
+                transcodeAudio: !audioCompatible
+              }, outputPath);
+            } else {
+              processing = 'transcoded';
+              outputInfo = await ffmpeg.transcodeVideo(req.file.path, {
                 keepOriginalAudio: true,
                 inputInfo
               }, outputPath);
-              return saveVideoOutput(req.file, outputPath, outputInfo, req.gpid);
-            });
+            }
+
+            return saveVideoOutput(req.file, outputPath, outputInfo, req.gpid);
+          }));
+        }
 
         res.json({
           ok: true,
           media,
           name: media.name,
-          processing: publishOriginal ? 'direct' : 'transcoded'
+          processing
         });
       } finally {
         await removeUploadedFiles(req.file);
@@ -481,10 +502,9 @@ function createApp() {
 
   async function downloadMusicToTemp(track, dir) {
     if (!track) { return null; }
-    const content = await storage.getBuffer(track.key);
-    if (!content) { throw new Error('A música selecionada não foi encontrada no armazenamento.'); }
     const musicPath = path.join(dir, 'music.' + extOf(track.name));
-    await fs.writeFile(musicPath, content);
+    const found = await storage.getFile(track.key, musicPath);
+    if (!found) { throw new Error('A música selecionada não foi encontrada no armazenamento.'); }
     return musicPath;
   }
 
@@ -513,7 +533,7 @@ function createApp() {
         });
       }
 
-      const media = await withTempDir(async (dir) => {
+      const media = await processingQueue.run(() => withTempDir(async (dir) => {
         const outputPath = path.join(dir, 'output.mp4');
         let music = null;
         let durationSeconds = 60;
@@ -536,7 +556,7 @@ function createApp() {
           outputPath
         );
         return saveVideoOutput(req.file, outputPath, outputInfo, req.gpid);
-      });
+      }));
 
       res.json({ ok: true, media, name: media.name });
     } finally {
@@ -579,7 +599,7 @@ function createApp() {
 
     res.status(error.status || 500).json({
       error: error.message || 'Falha interna no servidor.',
-      code: 'INTERNAL_ERROR'
+      code: error.code || 'INTERNAL_ERROR'
     });
   });
 
