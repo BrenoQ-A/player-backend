@@ -18,6 +18,7 @@ const ffmpeg = require('./ffmpeg');
 const { createStorage } = require('./storage');
 const { createCatalog } = require('./catalog');
 const { createProcessingQueue } = require('./processing-queue');
+const { createProgressTracker } = require('./progress-tracker');
 
 const {
   GITHUB_TOKEN,
@@ -196,6 +197,7 @@ function createApp() {
   const storage = createStorage();
   const catalog = createCatalog(storage);
   const processingQueue = createProcessingQueue({ maxPending: MAX_PROCESSING_QUEUE });
+  const progressTracker = createProgressTracker();
   const app = express();
   const uploadDir = path.join(os.tmpdir(), 'player-uploads');
   const allowedOrigins = ALLOWED_ORIGIN.split(',').map((item) => item.trim()).filter(Boolean);
@@ -251,8 +253,20 @@ function createApp() {
       service: 'player-sinalizacao-backend',
       storage: storage.driver,
       processing: processingQueue.stats(),
+      progress: progressTracker.stats(),
       timestamp: new Date().toISOString()
     });
+  });
+
+  app.get('/api/media/progress/:id', requireAuth, function mediaProgress(req, res) {
+    const progress = progressTracker.get(req.params.id, req.gpid);
+    if (!progress) {
+      return res.status(404).json({
+        error: 'Progresso não encontrado.',
+        code: 'PROGRESS_NOT_FOUND'
+      });
+    }
+    res.json({ progress });
   });
 
   app.post('/api/auth/register', asyncRoute(async (req, res) => {
@@ -315,7 +329,13 @@ function createApp() {
     });
   }));
 
-  async function saveVideoOutput(originalFile, outputPath, outputInfo, uploadedBy) {
+  async function saveVideoOutput(
+    originalFile,
+    outputPath,
+    outputInfo,
+    uploadedBy,
+    onStorageProgress
+  ) {
     const stat = await fs.stat(outputPath);
     if (stat.size > MAX_OUTPUT_MB * 1024 * 1024) {
       throw new Error(
@@ -331,7 +351,8 @@ function createApp() {
       key,
       outputPath,
       'video/mp4',
-      'public, max-age=3600'
+      'public, max-age=3600',
+      onStorageProgress
     );
 
     try {
@@ -362,8 +383,30 @@ function createApp() {
       }
 
       try {
+        const uploadId = req.get('x-upload-id') || '';
+        progressTracker.start(uploadId, req.gpid, req.file.originalname);
+        const report = function report(patch) {
+          progressTracker.update(uploadId, req.gpid, patch);
+        };
+        const reportStorage = function reportStorage(progress) {
+          report({
+            stage: 'publishing',
+            percent: Math.floor((Number(progress.percent) || 0) * 10) / 10,
+            message: 'Enviando o arquivo preparado ao armazenamento R2.'
+          });
+        };
+
+        report({
+          stage: 'checking',
+          percent: 0,
+          message: 'Verificando codecs, resolução, FPS e faststart.'
+        });
         const extension = extOf(req.file.originalname);
         if (!VIDEO_EXT.includes(extension)) {
+          report({
+            stage: 'failed',
+            message: 'Formato de vídeo não suportado.'
+          });
           return res.status(400).json({
             error: 'Formato não suportado. Selecione um arquivo de vídeo.'
           });
@@ -379,36 +422,99 @@ function createApp() {
         let media;
 
         if (isMp4 && videoCompatible && audioCompatible && fastStart) {
-          media = await saveVideoOutput(req.file, req.file.path, inputInfo, req.gpid);
+          processing = 'direct';
+          report({
+            stage: 'publishing',
+            percent: 0,
+            processing,
+            message: 'Vídeo compatível. Publicando diretamente, sem conversão.'
+          });
+          media = await saveVideoOutput(
+            req.file,
+            req.file.path,
+            inputInfo,
+            req.gpid,
+            reportStorage
+          );
         } else {
+          const queueState = processingQueue.stats();
+          report({
+            stage: 'queued',
+            percent: 0,
+            queuePosition: queueState.active + queueState.waiting + 1,
+            message: 'Aguardando a vez na fila de processamento.'
+          });
           media = await processingQueue.run(() => withTempDir(async (dir) => {
             const outputPath = path.join(dir, 'output.mp4');
             let outputInfo;
 
             if (videoCompatible) {
               processing = audioCompatible ? 'remuxed' : 'audio-transcoded';
+              report({
+                stage: audioCompatible ? 'remuxing' : 'audio-transcoding',
+                percent: 0,
+                processing,
+                queuePosition: null,
+                message: audioCompatible
+                  ? 'Reorganizando o MP4 sem recodificar o vídeo.'
+                  : 'Preservando o vídeo e convertendo somente o áudio.'
+              });
               outputInfo = await ffmpeg.remuxVideo(req.file.path, {
                 inputInfo,
-                transcodeAudio: !audioCompatible
+                transcodeAudio: !audioCompatible,
+                onProgress: (progress) => report({ percent: progress.percent })
               }, outputPath);
             } else {
               processing = 'transcoded';
+              report({
+                stage: 'transcoding',
+                percent: 0,
+                processing,
+                queuePosition: null,
+                message: 'Recodificando o vídeo para o perfil compatível com a TV.'
+              });
               outputInfo = await ffmpeg.transcodeVideo(req.file.path, {
                 keepOriginalAudio: true,
-                inputInfo
+                inputInfo,
+                onProgress: (progress) => report({ percent: progress.percent })
               }, outputPath);
             }
 
-            return saveVideoOutput(req.file, outputPath, outputInfo, req.gpid);
+            report({
+              stage: 'publishing',
+              percent: 0,
+              processing,
+              message: 'Processamento concluído. Enviando ao armazenamento R2.'
+            });
+            return saveVideoOutput(
+              req.file,
+              outputPath,
+              outputInfo,
+              req.gpid,
+              reportStorage
+            );
           }));
         }
 
+        report({
+          stage: 'complete',
+          percent: 100,
+          processing,
+          message: 'Vídeo publicado com sucesso.'
+        });
         res.json({
           ok: true,
           media,
           name: media.name,
           processing
         });
+      } catch (error) {
+        const uploadId = req.get('x-upload-id') || '';
+        progressTracker.update(uploadId, req.gpid, {
+          stage: 'failed',
+          message: error.message || 'Falha ao processar o vídeo.'
+        });
+        throw error;
       } finally {
         await removeUploadedFiles(req.file);
       }
