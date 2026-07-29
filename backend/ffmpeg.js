@@ -39,17 +39,59 @@ const AUDIO_ARGS = [
   '-ar', '48000'
 ];
 
-function run(binary, args) {
+function run(binary, args, options) {
+  const opts = options || {};
   return new Promise((resolve, reject) => {
     const commandArgs = binary === ffmpegPath
-      ? ['-hide_banner', '-loglevel', 'error', '-nostdin'].concat(args)
+      ? ['-hide_banner', '-loglevel', 'error', '-nostdin']
+        .concat(opts.onProgress ? ['-progress', 'pipe:1', '-nostats'] : [])
+        .concat(args)
       : args;
     const proc = spawn(binary, commandArgs);
     let stdout = '';
     let stderr = '';
+    let progressBuffer = '';
+    let outTimeUs = 0;
+    let lastPercent = -1;
+
+    function emitProgress(finished) {
+      if (!opts.onProgress) { return; }
+      const durationSeconds = Number(opts.durationSeconds) || 0;
+      const calculated = durationSeconds > 0
+        ? Math.min(100, Math.max(0, outTimeUs / 1000000 / durationSeconds * 100))
+        : 0;
+      const percent = finished ? 100 : Math.floor(calculated * 10) / 10;
+      if (percent === lastPercent) { return; }
+      lastPercent = percent;
+      opts.onProgress({
+        percent,
+        processedSeconds: outTimeUs / 1000000,
+        durationSeconds
+      });
+    }
+
+    function parseProgress(data) {
+      if (!opts.onProgress) { return; }
+      progressBuffer += data.toString();
+      const lines = progressBuffer.split(/\r?\n/);
+      progressBuffer = lines.pop() || '';
+      lines.forEach((line) => {
+        const separator = line.indexOf('=');
+        if (separator < 0) { return; }
+        const key = line.slice(0, separator);
+        const value = line.slice(separator + 1);
+        if (key === 'out_time_us' || key === 'out_time_ms') {
+          outTimeUs = Math.max(outTimeUs, Number(value) || 0);
+        }
+        if (key === 'progress') {
+          emitProgress(value === 'end');
+        }
+      });
+    }
 
     proc.stdout.on('data', (data) => {
       stdout = (stdout + data.toString()).slice(-MAX_CAPTURE_CHARS);
+      parseProgress(data);
     });
     proc.stderr.on('data', (data) => {
       stderr = (stderr + data.toString()).slice(-MAX_CAPTURE_CHARS);
@@ -57,6 +99,7 @@ function run(binary, args) {
     proc.on('error', reject);
     proc.on('close', (code) => {
       if (code === 0) {
+        emitProgress(true);
         resolve({ stdout, stderr });
       } else {
         reject(new Error(
@@ -155,7 +198,7 @@ function videoOutputArgs(frameRate) {
     .concat(['-r', String(frameRate || VIDEO_FPS)]);
 }
 
-async function imageToVideo(imagePath, musicPath, durationSeconds, outPath) {
+async function imageToVideo(imagePath, musicPath, durationSeconds, outPath, onProgress) {
   const args = [
     '-y',
     '-loop', '1',
@@ -180,7 +223,7 @@ async function imageToVideo(imagePath, musicPath, durationSeconds, outPath) {
   }
 
   args.push(outPath);
-  await run(ffmpegPath, args);
+  await run(ffmpegPath, args, { durationSeconds, onProgress });
   return probe(outPath);
 }
 
@@ -210,7 +253,10 @@ async function transcodeVideo(videoPath, options, outPath) {
   }
 
   args.push(outPath);
-  await run(ffmpegPath, args);
+  await run(ffmpegPath, args, {
+    durationSeconds: inputInfo.durationSeconds,
+    onProgress: opts.onProgress
+  });
   return probe(outPath);
 }
 
@@ -236,7 +282,10 @@ async function remuxVideo(videoPath, options, outPath) {
   }
 
   args.push('-movflags', '+faststart', outPath);
-  await run(ffmpegPath, args);
+  await run(ffmpegPath, args, {
+    durationSeconds: inputInfo.durationSeconds,
+    onProgress: opts.onProgress
+  });
   return probe(outPath);
 }
 
