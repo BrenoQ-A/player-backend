@@ -5,6 +5,7 @@ const path = require('path');
 const youtubedl = require('youtube-dl-exec');
 const ffmpegPath = require('ffmpeg-static');
 
+const MAX_COOKIE_FILE_BYTES = 1024 * 1024;
 const ALLOWED_HOSTS = new Set([
   'youtube.com',
   'www.youtube.com',
@@ -17,6 +18,13 @@ function userError(message, code) {
   const error = new Error(message);
   error.status = 422;
   error.code = code || 'YOUTUBE_AUDIO_INVALID';
+  return error;
+}
+
+function serviceError(message, code) {
+  const error = new Error(message);
+  error.status = 503;
+  error.code = code || 'YOUTUBE_AUDIO_UNAVAILABLE';
   return error;
 }
 
@@ -56,8 +64,9 @@ function positiveNumber(value, fallback) {
   return Number.isFinite(number) && number > 0 ? number : fallback;
 }
 
-function friendlyExtractionError(error) {
+function friendlyExtractionError(error, context) {
   if (error && error.status) { return error; }
+  const hasCookies = Boolean(context && context.hasCookies);
   const details = String(
     (error && (error.stderr || error.message)) || ''
   ).toLowerCase();
@@ -67,9 +76,15 @@ function friendlyExtractionError(error) {
     details.includes('not a bot') ||
     details.includes('bot detection')
   ) {
-    return userError(
-      'O YouTube recusou a solicitação do servidor. Tente novamente mais tarde ou envie o arquivo de áudio manualmente.',
-      'YOUTUBE_SERVER_BLOCKED'
+    if (hasCookies) {
+      return serviceError(
+        'O YouTube rejeitou a sessão configurada no servidor. Atualize os cookies do YouTube no Render.',
+        'YOUTUBE_COOKIES_EXPIRED'
+      );
+    }
+    return serviceError(
+      'O YouTube bloqueou o IP do servidor. Configure a credencial YOUTUBE_COOKIES_BASE64 no Render.',
+      'YOUTUBE_COOKIES_REQUIRED'
     );
   }
   if (details.includes('private video') || details.includes('video unavailable')) {
@@ -100,6 +115,60 @@ function friendlyExtractionError(error) {
   );
 }
 
+function decodeCookieFile(encodedValue) {
+  const compactValue = String(encodedValue || '').replace(/\s+/g, '');
+  if (!compactValue) { return null; }
+  if (
+    compactValue.length > MAX_COOKIE_FILE_BYTES * 2 ||
+    compactValue.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(compactValue)
+  ) {
+    throw serviceError(
+      'A credencial YOUTUBE_COOKIES_BASE64 não contém um arquivo cookies.txt válido.',
+      'YOUTUBE_COOKIES_INVALID'
+    );
+  }
+
+  const decoded = Buffer.from(compactValue, 'base64');
+  if (!decoded.length || decoded.length > MAX_COOKIE_FILE_BYTES) {
+    throw serviceError(
+      'A credencial YOUTUBE_COOKIES_BASE64 excede o tamanho permitido ou está vazia.',
+      'YOUTUBE_COOKIES_INVALID'
+    );
+  }
+
+  const contents = decoded.toString('utf8').replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+  const lines = contents.split('\n');
+  const header = String(lines[0] || '').trim();
+  const hasValidHeader =
+    header === '# Netscape HTTP Cookie File' ||
+    header === '# HTTP Cookie File';
+  const hasYouTubeCookie = lines.some((line) => {
+    const value = line.startsWith('#HttpOnly_') ? line.slice('#HttpOnly_'.length) : line;
+    if (!value || value.startsWith('#')) { return false; }
+    const fields = value.split('\t');
+    const domain = String(fields[0] || '').replace(/^\./, '').toLowerCase();
+    return fields.length >= 7 && (domain === 'youtube.com' || domain.endsWith('.youtube.com'));
+  });
+
+  if (!hasValidHeader || !hasYouTubeCookie) {
+    throw serviceError(
+      'A credencial YOUTUBE_COOKIES_BASE64 deve ser um cookies.txt Netscape exportado para youtube.com.',
+      'YOUTUBE_COOKIES_INVALID'
+    );
+  }
+
+  return contents;
+}
+
+async function prepareCookieFile(dir, encodedValue) {
+  const contents = decodeCookieFile(encodedValue);
+  if (!contents) { return null; }
+  const cookiePath = path.join(dir, 'youtube-cookies.txt');
+  await fs.writeFile(cookiePath, contents, { encoding: 'utf8', mode: 0o600 });
+  return cookiePath;
+}
+
 async function findExtractedMp3(dir) {
   const entries = await fs.readdir(dir, { withFileTypes: true });
   const match = entries.find((entry) => entry.isFile() && /\.mp3$/i.test(entry.name));
@@ -128,10 +197,23 @@ async function extractYouTubeAudio(value, dir, options) {
     opts.timeoutMs || process.env.YOUTUBE_AUDIO_TIMEOUT_MS,
     180000
   );
+  const jsRuntime = String(
+    opts.jsRuntime || process.env.YOUTUBE_JS_RUNTIME || 'node'
+  ).trim() || 'node';
+  const cookiesBase64 = opts.cookiesBase64 !== undefined
+    ? opts.cookiesBase64
+    : process.env.YOUTUBE_COOKIES_BASE64;
   const spawnOptions = { timeout: timeoutMs, killSignal: 'SIGKILL' };
+  let cookiePath = null;
 
   try {
+    cookiePath = await prepareCookieFile(dir, cookiesBase64);
+    const commonFlags = {
+      jsRuntimes: jsRuntime,
+      ...(cookiePath ? { cookies: cookiePath } : {})
+    };
     const metadata = await run(url, {
+      ...commonFlags,
       dumpSingleJson: true,
       skipDownload: true,
       noPlaylist: true,
@@ -166,6 +248,7 @@ async function extractYouTubeAudio(value, dir, options) {
 
     const outputTemplate = path.join(dir, 'youtube-audio.%(ext)s');
     await run(url, {
+      ...commonFlags,
       extractAudio: true,
       audioFormat: 'mp3',
       audioQuality: '5',
@@ -194,11 +277,16 @@ async function extractYouTubeAudio(value, dir, options) {
       sizeBytes: stat.size
     };
   } catch (error) {
-    throw friendlyExtractionError(error);
+    throw friendlyExtractionError(error, { hasCookies: Boolean(cookiePath) });
+  } finally {
+    if (cookiePath) {
+      await fs.rm(cookiePath, { force: true }).catch(() => {});
+    }
   }
 }
 
 module.exports = {
+  decodeCookieFile,
   extractYouTubeAudio,
   validateYouTubeUrl,
   friendlyExtractionError
