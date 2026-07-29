@@ -44,8 +44,10 @@ test('converte vídeo incompatível para H.264/AAC da Samsung 2015', async () =>
     const inputInfo = await media.probe(input);
     assert.equal(media.isSamsungCompatible(inputInfo), false);
 
+    const progress = [];
     const info = await media.transcodeVideo(input, {
-      keepOriginalAudio: true
+      keepOriginalAudio: true,
+      onProgress: (event) => progress.push(event.percent)
     }, output);
 
     assert.equal(info.video.codec_name, 'h264');
@@ -54,6 +56,8 @@ test('converte vídeo incompatível para H.264/AAC da Samsung 2015', async () =>
     assert.ok(info.video.width <= media.constants.MAX_WIDTH);
     assert.ok(info.video.height <= media.constants.MAX_HEIGHT);
     assert.ok(info.durationSeconds > 0);
+    assert.ok(progress.length > 0);
+    assert.equal(progress[progress.length - 1], 100);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
@@ -115,12 +119,17 @@ test('reposiciona faststart sem recodificar vídeo compatível', async () => {
     assert.equal(media.isSamsungCompatible(inputInfo), true);
     assert.equal(await media.hasFastStart(input), false);
 
-    const outputInfo = await media.remuxVideo(input, { inputInfo }, output);
+    const progress = [];
+    const outputInfo = await media.remuxVideo(input, {
+      inputInfo,
+      onProgress: (event) => progress.push(event.percent)
+    }, output);
     assert.equal(outputInfo.video.codec_name, inputInfo.video.codec_name);
     assert.equal(outputInfo.video.width, inputInfo.video.width);
     assert.equal(outputInfo.video.height, inputInfo.video.height);
     assert.equal(outputInfo.audio.codec_name, 'aac');
     assert.equal(await media.hasFastStart(output), true);
+    assert.equal(progress[progress.length - 1], 100);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
