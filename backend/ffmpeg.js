@@ -1,6 +1,7 @@
 'use strict';
 
 const { spawn } = require('child_process');
+const fs = require('fs/promises');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
 
@@ -64,8 +65,9 @@ function run(binary, args) {
 async function probe(filePath) {
   const result = await run(ffprobePath, [
     '-v', 'error',
-    '-show_entries', 'format=duration,size',
-    '-show_entries', 'stream=codec_type,codec_name,profile,width,height,pix_fmt,r_frame_rate',
+    '-show_entries', 'format=duration,size,bit_rate',
+    '-show_entries',
+    'stream=codec_type,codec_name,profile,level,width,height,pix_fmt,r_frame_rate,avg_frame_rate,sample_rate,channels',
     '-of', 'json',
     filePath
   ]);
@@ -76,9 +78,62 @@ async function probe(filePath) {
   return {
     durationSeconds: Number(data.format && data.format.duration) || null,
     sizeBytes: Number(data.format && data.format.size) || null,
+    bitRate: Number(data.format && data.format.bit_rate) || null,
     video,
     audio
   };
+}
+
+function rateToNumber(rate) {
+  const parts = String(rate || '').split('/');
+  const numerator = Number(parts[0]);
+  const denominator = Number(parts[1] || 1);
+  if (!Number.isFinite(numerator) || !Number.isFinite(denominator) || denominator === 0) {
+    return 0;
+  }
+  return numerator / denominator;
+}
+
+function isSamsungCompatible(info) {
+  const video = info && info.video;
+  const audio = info && info.audio;
+  if (!video) { return false; }
+
+  const frameRate = rateToNumber(video.avg_frame_rate || video.r_frame_rate);
+  const bitRate = Number(info.bitRate) ||
+    (Number(info.sizeBytes) * 8 / Number(info.durationSeconds));
+  const profile = String(video.profile || '');
+
+  return (
+    video.codec_name === 'h264' &&
+    /baseline|main|high/i.test(profile) &&
+    Number(video.level) <= 41 &&
+    Number(video.width) <= 1920 &&
+    Number(video.height) <= 1080 &&
+    video.pix_fmt === 'yuv420p' &&
+    frameRate > 0 &&
+    frameRate <= 30.01 &&
+    bitRate > 0 &&
+    bitRate <= 30000000 &&
+    (!audio || (
+      audio.codec_name === 'aac' &&
+      (!audio.channels || Number(audio.channels) <= 2)
+    ))
+  );
+}
+
+async function hasFastStart(filePath) {
+  const handle = await fs.open(filePath, 'r');
+  try {
+    const stat = await handle.stat();
+    const buffer = Buffer.alloc(Math.min(stat.size, 2 * 1024 * 1024));
+    await handle.read(buffer, 0, buffer.length, 0);
+    const moovIndex = buffer.indexOf('moov');
+    const mdatIndex = buffer.indexOf('mdat');
+    return moovIndex >= 0 && (mdatIndex < 0 || moovIndex < mdatIndex);
+  } finally {
+    await handle.close();
+  }
 }
 
 function videoOutputArgs() {
@@ -116,7 +171,7 @@ async function imageToVideo(imagePath, musicPath, durationSeconds, outPath) {
 
 async function transcodeVideo(videoPath, options, outPath) {
   const opts = options || {};
-  const inputInfo = await probe(videoPath);
+  const inputInfo = opts.inputInfo || await probe(videoPath);
   const args = ['-y', '-i', videoPath];
 
   if (opts.musicPath) {
@@ -148,5 +203,7 @@ module.exports = {
   imageToVideo,
   transcodeVideo,
   probe,
+  isSamsungCompatible,
+  hasFastStart,
   constants: { SCALE_FILTER, VIDEO_ARGS, AUDIO_ARGS }
 };

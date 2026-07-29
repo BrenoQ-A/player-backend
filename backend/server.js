@@ -365,15 +365,29 @@ function createApp() {
           });
         }
 
-        const media = await withTempDir(async (dir) => {
-          const outputPath = path.join(dir, 'output.mp4');
-          const outputInfo = await ffmpeg.transcodeVideo(req.file.path, {
-            keepOriginalAudio: true
-          }, outputPath);
-          return saveVideoOutput(req.file, outputPath, outputInfo, req.gpid);
-        });
+        const inputInfo = await ffmpeg.probe(req.file.path);
+        const publishOriginal =
+          extension === 'mp4' &&
+          ffmpeg.isSamsungCompatible(inputInfo) &&
+          await ffmpeg.hasFastStart(req.file.path);
 
-        res.json({ ok: true, media, name: media.name });
+        const media = publishOriginal
+          ? await saveVideoOutput(req.file, req.file.path, inputInfo, req.gpid)
+          : await withTempDir(async (dir) => {
+              const outputPath = path.join(dir, 'output.mp4');
+              const outputInfo = await ffmpeg.transcodeVideo(req.file.path, {
+                keepOriginalAudio: true,
+                inputInfo
+              }, outputPath);
+              return saveVideoOutput(req.file, outputPath, outputInfo, req.gpid);
+            });
+
+        res.json({
+          ok: true,
+          media,
+          name: media.name,
+          processing: publishOriginal ? 'direct' : 'transcoded'
+        });
       } finally {
         await removeUploadedFiles(req.file);
       }
