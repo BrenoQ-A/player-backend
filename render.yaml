@@ -68,3 +68,9 @@ services:
         value: "1"
       - key: STORAGE_UPLOAD_PART_MB
         value: "8"
+      - key: YOUTUBE_AUDIO_MAX_MINUTES
+        value: "60"
+      - key: YOUTUBE_AUDIO_MAX_MB
+        value: "100"
+      - key: YOUTUBE_AUDIO_TIMEOUT_MS
+        value: "180000"

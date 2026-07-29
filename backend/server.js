@@ -19,6 +19,7 @@ const { createStorage } = require('./storage');
 const { createCatalog } = require('./catalog');
 const { createProcessingQueue } = require('./processing-queue');
 const { createProgressTracker } = require('./progress-tracker');
+const { extractYouTubeAudio } = require('./youtube-audio');
 
 const {
   GITHUB_TOKEN,
@@ -594,6 +595,47 @@ function createApp() {
       }
     })
   );
+
+  app.post('/api/music/youtube', requireAuth, asyncRoute(async (req, res) => {
+    const url = req.body && req.body.url;
+    const authorized = req.body && req.body.authorized;
+    if (authorized !== true) {
+      return res.status(400).json({
+        error: 'Confirme que você tem autorização para utilizar esse conteúdo.',
+        code: 'CONTENT_AUTHORIZATION_REQUIRED'
+      });
+    }
+
+    const track = await processingQueue.run(() => withTempDir(async (dir) => {
+      const extracted = await extractYouTubeAudio(url, dir);
+      const storedName = safeBaseName(extracted.title) + '.mp3';
+      const key = 'music/' + crypto.randomUUID() + '-' + storedName;
+
+      await storage.putFile(
+        key,
+        extracted.filePath,
+        'audio/mpeg',
+        'public, max-age=3600'
+      );
+      try {
+        return await catalog.addMusic({
+          name: extracted.title + '.mp3',
+          key,
+          sizeBytes: extracted.sizeBytes,
+          durationSeconds: extracted.durationSeconds,
+          source: 'youtube',
+          sourceUrl: extracted.sourceUrl,
+          sourceId: extracted.sourceId,
+          uploadedBy: req.gpid
+        });
+      } catch (error) {
+        await storage.deleteObject(key).catch(() => {});
+        throw error;
+      }
+    }));
+
+    res.json({ ok: true, music: track });
+  }));
 
   app.delete('/api/music/:id', requireAuth, asyncRoute(async (req, res) => {
     const library = await catalog.getMusicLibrary();
