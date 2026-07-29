@@ -89,14 +89,19 @@ function createStorage(options) {
     await fsp.mkdir(path.dirname(localPath(key)), { recursive: true });
   }
 
-  async function putFile(key, filePath, contentType, cacheControl) {
+  async function putFile(key, filePath, contentType, cacheControl, onProgress) {
     assertSafeKey(key);
     if (driver === 'local') {
       await ensureLocalParent(key);
       await fsp.copyFile(filePath, localPath(key));
+      if (onProgress) {
+        const stat = await fsp.stat(filePath);
+        onProgress({ loaded: stat.size, total: stat.size, percent: 100 });
+      }
       return;
     }
 
+    const stat = await fsp.stat(filePath);
     const uploadConcurrency = Math.max(
       1,
       Number(process.env.STORAGE_UPLOAD_CONCURRENCY || 1)
@@ -114,10 +119,22 @@ function createStorage(options) {
         Bucket: bucket,
         Key: key,
         Body: fs.createReadStream(filePath),
+        ContentLength: stat.size,
         ContentType: contentType || 'application/octet-stream',
         CacheControl: cacheControl || undefined
       }
     });
+    if (onProgress) {
+      upload.on('httpUploadProgress', (progress) => {
+        const loaded = Number(progress.loaded) || 0;
+        const total = Number(progress.total) || stat.size;
+        onProgress({
+          loaded,
+          total,
+          percent: total > 0 ? Math.min(100, loaded / total * 100) : 0
+        });
+      });
+    }
     await upload.done();
   }
 
