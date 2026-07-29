@@ -41,6 +41,9 @@ test('converte vídeo incompatível para H.264/AAC da Samsung 2015', async () =>
       input
     ]);
 
+    const inputInfo = await media.probe(input);
+    assert.equal(media.isSamsungCompatible(inputInfo), false);
+
     const info = await media.transcodeVideo(input, {
       keepOriginalAudio: true
     }, output);
@@ -51,6 +54,36 @@ test('converte vídeo incompatível para H.264/AAC da Samsung 2015', async () =>
     assert.ok(info.video.width <= 1920);
     assert.ok(info.video.height <= 1080);
     assert.ok(info.durationSeconds > 0);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('reconhece MP4 já compatível e com faststart', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'player-ffmpeg-test-'));
+  const input = path.join(dir, 'entrada-compativel.mp4');
+
+  try {
+    await run([
+      '-y',
+      '-f', 'lavfi',
+      '-i', 'testsrc=size=640x360:rate=30',
+      '-f', 'lavfi',
+      '-i', 'sine=frequency=1000:sample_rate=44100',
+      '-t', '1',
+      '-c:v', 'libx264',
+      '-profile:v', 'high',
+      '-level:v', '4.0',
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-ac', '2',
+      '-movflags', '+faststart',
+      input
+    ]);
+
+    const info = await media.probe(input);
+    assert.equal(media.isSamsungCompatible(info), true);
+    assert.equal(await media.hasFastStart(input), true);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
