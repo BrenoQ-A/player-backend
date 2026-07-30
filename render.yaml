@@ -22,6 +22,14 @@ services:
         generateValue: true
       - key: INVITE_CODE
         sync: false
+      - key: ADMIN_GPIDS
+        sync: false
+      - key: AUTH_CACHE_SECONDS
+        value: "60"
+      - key: RESET_CODE_TTL_MINUTES
+        value: "30"
+      - key: RESET_MAX_ATTEMPTS
+        value: "5"
       - key: ALLOWED_ORIGIN
         sync: false
       - key: BACKEND_PUBLIC_URL

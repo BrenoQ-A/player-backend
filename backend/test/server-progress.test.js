@@ -17,6 +17,17 @@ process.env.INVITE_CODE = 'test';
 process.env.ALLOWED_ORIGIN = 'http://localhost:8080';
 process.env.STORAGE_DRIVER = 'local';
 
+const gh = require('../github');
+gh.getContents = async function getTestUsers(repo, filePath) {
+  if (filePath !== 'users.json') return null;
+  return {
+    sha: 'users-test-sha',
+    content: Buffer.from(JSON.stringify([
+      { gpid: 'TESTUSER', authVersion: 1 },
+      { gpid: 'OUTRO', authVersion: 1 }
+    ])).toString('base64')
+  };
+};
 const { createApp } = require('../server');
 
 function runFfmpeg(args) {
@@ -54,7 +65,7 @@ test('expõe o resultado do progresso para o upload autenticado', async () => {
       const instance = app.listen(0, '127.0.0.1', () => resolve(instance));
     });
     const baseUrl = 'http://127.0.0.1:' + server.address().port;
-    const token = jwt.sign({ gpid: '09521542' }, TEST_SECRET, { expiresIn: '5m' });
+    const token = jwt.sign({ gpid: 'TESTUSER' }, TEST_SECRET, { expiresIn: '5m' });
     const uploadId = 'upload-integration-12345678';
     const form = new FormData();
     form.append(

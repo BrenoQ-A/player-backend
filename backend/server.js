@@ -20,6 +20,10 @@ const { createCatalog } = require('./catalog');
 const { createProcessingQueue } = require('./processing-queue');
 const { createProgressTracker } = require('./progress-tracker');
 const { extractYouTubeAudio } = require('./youtube-audio');
+const {
+  createResetCode, digestResetCode, normalizeGpid,
+  resetRecordIsActive, verifyResetCode
+} = require('./password-reset');
 
 const {
   GITHUB_TOKEN,
@@ -28,6 +32,7 @@ const {
   JWT_SECRET,
   INVITE_CODE,
   ALLOWED_ORIGIN,
+  ADMIN_GPIDS = '',
   PORT = 3000
 } = process.env;
 
@@ -35,10 +40,19 @@ const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 500);
 const MAX_OUTPUT_MB = Number(process.env.MAX_OUTPUT_MB || 1000);
 const MAX_PROCESSING_QUEUE = Number(process.env.MAX_PROCESSING_QUEUE || 4);
 const SESSION_DAYS = 30;
+const AUTH_CACHE_MS = Number(process.env.AUTH_CACHE_SECONDS || 60) * 1000;
+const RESET_CODE_TTL_MS = Number(process.env.RESET_CODE_TTL_MINUTES || 30) * 60000;
+const RESET_MAX_ATTEMPTS = Number(process.env.RESET_MAX_ATTEMPTS || 5);
+const RESET_RATE_LIMIT_WINDOW_MS = 15 * 60000;
+const RESET_RATE_LIMIT_MAX = 10;
 const USERS_PATH = 'users.json';
 const IMAGE_EXT = ['jpg', 'jpeg', 'png'];
 const VIDEO_EXT = ['mp4', 'webm', 'ogg', 'mov', 'mkv', 'avi', 'mpeg', 'mpg'];
 const AUDIO_EXT = ['mp3', 'wav', 'ogg', 'm4a', 'aac', 'flac'];
+const ADMIN_GPID_SET = new Set(ADMIN_GPIDS.split(',').map(normalizeGpid).filter(Boolean));
+const resetAttemptWindows = new Map();
+let usersCache = null;
+let usersCacheExpiresAt = 0;
 
 const DEFAULT_CONFIG = {
   imageDurationSeconds: 15,
@@ -125,9 +139,20 @@ function sanitizeConfig(body) {
 
 async function loadUsers() {
   const file = await gh.getContents(PRIVATE_REPO, USERS_PATH, PRIVATE_BRANCH);
-  if (!file) { return { users: [], sha: null }; }
+  if (!file) {
+    const empty = { users: [], sha: null };
+    usersCache = empty;
+    usersCacheExpiresAt = Date.now() + AUTH_CACHE_MS;
+    return empty;
+  }
   const decoded = Buffer.from(file.content, 'base64').toString('utf8');
-  return { users: JSON.parse(decoded), sha: file.sha };
+  const loaded = { users: JSON.parse(decoded), sha: file.sha };
+  usersCache = loaded;
+  usersCacheExpiresAt = Date.now() + AUTH_CACHE_MS;
+  return loaded;
+}
+async function loadUsersCached() {
+  return usersCache && usersCacheExpiresAt > Date.now() ? usersCache : loadUsers();
 }
 
 async function saveUsers(users, sha, message) {
@@ -139,11 +164,22 @@ async function saveUsers(users, sha, message) {
     message,
     sha || undefined
   );
+  usersCache = { users, sha: result.content.sha };
+  usersCacheExpiresAt = Date.now() + AUTH_CACHE_MS;
   return result.content.sha;
 }
 
-function issueToken(res, gpid) {
-  const token = jwt.sign({ gpid }, JWT_SECRET, { expiresIn: SESSION_DAYS + 'd' });
+function authVersionOf(value) {
+  const version = Number(value && value.authVersion);
+  return Number.isSafeInteger(version) && version >= 1 ? version : 1;
+}
+function isAdminGpid(gpid) {
+  return ADMIN_GPID_SET.has(normalizeGpid(gpid));
+}
+function issueToken(res, gpid, authVersion) {
+  const token = jwt.sign({ gpid, authVersion: authVersionOf({ authVersion }) }, JWT_SECRET, {
+    expiresIn: SESSION_DAYS + 'd'
+  });
   res.cookie('session', token, {
     httpOnly: true,
     secure: true,
@@ -151,6 +187,15 @@ function issueToken(res, gpid) {
     maxAge: SESSION_DAYS * 24 * 60 * 60 * 1000
   });
   return token;
+}
+function clearSessionCookie(res) {
+  res.clearCookie('session', { secure: true, sameSite: 'none' });
+}
+function expiredSession(res) {
+  return res.status(401).json({
+    error: 'Sessão expirada, faça login novamente.',
+    code: 'AUTH_EXPIRED'
+  });
 }
 
 function requireAuth(req, res, next) {
@@ -160,15 +205,44 @@ function requireAuth(req, res, next) {
   if (!token) {
     return res.status(401).json({ error: 'Não autenticado.', code: 'AUTH_REQUIRED' });
   }
+  let payload;
   try {
-    req.gpid = jwt.verify(token, JWT_SECRET).gpid;
-    next();
+    payload = jwt.verify(token, JWT_SECRET);
   } catch (error) {
-    res.status(401).json({
-      error: 'Sessão expirada, faça login novamente.',
-      code: 'AUTH_EXPIRED'
+    return expiredSession(res);
+  }
+  loadUsersCached().then(({ users }) => {
+    const gpid = normalizeGpid(payload.gpid);
+    const user = users.find((candidate) => normalizeGpid(candidate.gpid) === gpid);
+    if (!user || authVersionOf(payload) !== authVersionOf(user)) {
+      clearSessionCookie(res);
+      return expiredSession(res);
+    }
+    req.gpid = gpid;
+    req.user = user;
+    req.isAdmin = isAdminGpid(gpid);
+    next();
+  }).catch(next);
+}
+function requireAdmin(req, res, next) {
+  if (!req.isAdmin) {
+    return res.status(403).json({
+      error: 'Somente um administrador pode realizar esta ação.',
+      code: 'ADMIN_REQUIRED'
     });
   }
+  next();
+}
+function allowResetAttempt(req, gpid) {
+  const now = Date.now();
+  const key = String(req.ip || req.socket.remoteAddress || 'unknown') + '|' + normalizeGpid(gpid);
+  const current = resetAttemptWindows.get(key);
+  if (!current || current.resetAt <= now) {
+    resetAttemptWindows.set(key, { count: 1, resetAt: now + RESET_RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+  current.count += 1;
+  return current.count <= RESET_RATE_LIMIT_MAX;
 }
 
 function asyncRoute(handler) {
@@ -222,6 +296,7 @@ function createApp() {
   });
 
   app.disable('x-powered-by');
+  app.set('trust proxy', 1);
   app.use(function securityHeaders(req, res, next) {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
@@ -289,10 +364,11 @@ function createApp() {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    users.push({ gpid: gpidNorm, passwordHash, createdAt: new Date().toISOString() });
+    const user = { gpid: gpidNorm, passwordHash, authVersion: 1, createdAt: new Date().toISOString() };
+    users.push(user);
     await saveUsers(users, sha, 'Novo usuário: ' + gpidNorm);
-    const token = issueToken(res, gpidNorm);
-    res.json({ gpid: gpidNorm, token });
+    const token = issueToken(res, gpidNorm, user.authVersion);
+    res.json({ gpid: gpidNorm, token, isAdmin: isAdminGpid(gpidNorm) });
   }));
 
   app.post('/api/auth/login', asyncRoute(async (req, res) => {
@@ -309,18 +385,86 @@ function createApp() {
       return res.status(401).json({ error: 'GPID ou senha incorretos.' });
     }
 
-    const token = issueToken(res, gpidNorm);
-    res.json({ gpid: gpidNorm, token });
+    const token = issueToken(res, gpidNorm, authVersionOf(user));
+    res.json({ gpid: gpidNorm, token, isAdmin: isAdminGpid(gpidNorm) });
   }));
 
   app.post('/api/auth/logout', function logout(req, res) {
-    res.clearCookie('session', { secure: true, sameSite: 'none' });
+    clearSessionCookie(res);
     res.json({ ok: true });
   });
 
   app.get('/api/auth/session', requireAuth, function session(req, res) {
-    res.json({ gpid: req.gpid });
+    res.json({ gpid: req.gpid, isAdmin: req.isAdmin });
   });
+
+  app.post('/api/admin/password-resets', requireAuth, requireAdmin, asyncRoute(async (req, res) => {
+    const targetGpid = normalizeGpid(req.body && req.body.gpid);
+    if (!targetGpid) return res.status(400).json({ error: 'Informe o GPID do usuário.' });
+    const { users, sha } = await loadUsers();
+    const user = users.find((candidate) => normalizeGpid(candidate.gpid) === targetGpid);
+    if (!user) {
+      return res.status(404).json({
+        error: 'Nenhum cadastro foi encontrado para esse GPID.',
+        code: 'USER_NOT_FOUND'
+      });
+    }
+    const resetCode = createResetCode();
+    const now = Date.now();
+    const expiresAt = new Date(now + RESET_CODE_TTL_MS).toISOString();
+    user.passwordReset = {
+      digest: digestResetCode(resetCode, targetGpid, JWT_SECRET),
+      expiresAt,
+      attemptsRemaining: RESET_MAX_ATTEMPTS,
+      createdAt: new Date(now).toISOString(),
+      createdBy: req.gpid
+    };
+    await saveUsers(users, sha, 'Gerar redefinição de senha: ' + targetGpid);
+    res.json({ ok: true, gpid: targetGpid, resetCode, expiresAt, attempts: RESET_MAX_ATTEMPTS });
+  }));
+
+  app.post('/api/auth/reset-password', asyncRoute(async (req, res) => {
+    const gpid = normalizeGpid(req.body && req.body.gpid);
+    const resetCode = req.body && req.body.resetCode;
+    const password = req.body && req.body.password;
+    const genericError = {
+      error: 'GPID ou código de redefinição inválido ou expirado.',
+      code: 'RESET_INVALID'
+    };
+    if (!gpid || !resetCode || !password) {
+      return res.status(400).json({ error: 'GPID, código e nova senha são obrigatórios.' });
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ error: 'A nova senha precisa ter pelo menos 8 caracteres.' });
+    }
+    if (!allowResetAttempt(req, gpid)) {
+      return res.status(429).json({
+        error: 'Muitas tentativas. Aguarde 15 minutos antes de tentar novamente.',
+        code: 'RESET_RATE_LIMITED'
+      });
+    }
+    const { users, sha } = await loadUsers();
+    const user = users.find((candidate) => normalizeGpid(candidate.gpid) === gpid);
+    const record = user && user.passwordReset;
+    const active = resetRecordIsActive(record);
+    const valid = active && verifyResetCode(resetCode, gpid, record.digest, JWT_SECRET);
+    if (!valid) {
+      digestResetCode(resetCode, gpid, JWT_SECRET);
+      if (user && record) {
+        if (active) record.attemptsRemaining = Math.max(0, Number(record.attemptsRemaining) - 1);
+        if (!active || record.attemptsRemaining <= 0) delete user.passwordReset;
+        await saveUsers(users, sha, 'Registrar tentativa de redefinição: ' + gpid);
+      }
+      return res.status(400).json(genericError);
+    }
+    user.passwordHash = await bcrypt.hash(String(password), 12);
+    user.authVersion = authVersionOf(user) + 1;
+    user.passwordChangedAt = new Date().toISOString();
+    delete user.passwordReset;
+    await saveUsers(users, sha, 'Redefinir senha: ' + gpid);
+    clearSessionCookie(res);
+    res.json({ ok: true, message: 'Senha redefinida. Entre novamente com a nova senha.' });
+  }));
 
   app.get('/api/media', requireAuth, asyncRoute(async (req, res) => {
     const playlist = await catalog.getPlaylist();
