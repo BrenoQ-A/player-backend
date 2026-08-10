@@ -52,6 +52,9 @@ test('converte vídeo incompatível para H.264/AAC da Samsung 2015', async () =>
 
     assert.equal(info.video.codec_name, 'h264');
     assert.equal(info.video.pix_fmt, 'yuv420p');
+    assert.equal(info.video.sample_aspect_ratio, '1:1');
+    assert.match(info.video.profile, /baseline|main/i);
+    assert.ok(Number(info.video.level) <= 31);
     assert.equal(info.audio.codec_name, 'aac');
     assert.ok(info.video.width <= media.constants.MAX_WIDTH);
     assert.ok(info.video.height <= media.constants.MAX_HEIGHT);
@@ -76,8 +79,8 @@ test('reconhece MP4 já compatível e com faststart', async () => {
       '-i', 'sine=frequency=1000:sample_rate=44100',
       '-t', '1',
       '-c:v', 'libx264',
-      '-profile:v', 'high',
-      '-level:v', '4.0',
+      '-profile:v', 'main',
+      '-level:v', '3.1',
       '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
       '-ac', '2',
@@ -108,7 +111,7 @@ test('reposiciona faststart sem recodificar vídeo compatível', async () => {
       '-t', '1',
       '-c:v', 'libx264',
       '-profile:v', 'main',
-      '-level:v', '4.0',
+      '-level:v', '3.1',
       '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
       '-ac', '2',
@@ -150,7 +153,7 @@ test('mantém H.264 e converte somente áudio incompatível', async () => {
       '-t', '1',
       '-c:v', 'libx264',
       '-profile:v', 'main',
-      '-level:v', '4.0',
+      '-level:v', '3.1',
       '-pix_fmt', 'yuv420p',
       '-c:a', 'pcm_s16le',
       input
@@ -168,6 +171,78 @@ test('mantém H.264 e converte somente áudio incompatível', async () => {
     assert.equal(outputInfo.audio.codec_name, 'aac');
     assert.equal(media.isSamsungCompatible(outputInfo), true);
     assert.equal(await media.hasFastStart(output), true);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('rejeita 1080p, perfil High e bitrate excessivo para a Samsung UN32J4290', () => {
+  const compatible = {
+    bitRate: 2500000,
+    video: {
+      codec_name: 'h264',
+      profile: 'Main',
+      level: 31,
+      width: 1280,
+      height: 720,
+      sample_aspect_ratio: '1:1',
+      pix_fmt: 'yuv420p',
+      avg_frame_rate: '30/1',
+      bit_rate: '2300000'
+    },
+    audio: { codec_name: 'aac', channels: 2 }
+  };
+
+  assert.equal(media.isSamsungCompatible(compatible), true);
+  assert.equal(media.isSamsungVideoCompatible({
+    ...compatible,
+    video: { ...compatible.video, width: 1920, height: 1080 }
+  }), false);
+  assert.equal(media.isSamsungVideoCompatible({
+    ...compatible,
+    video: { ...compatible.video, profile: 'High' }
+  }), false);
+  assert.equal(media.isSamsungVideoCompatible({
+    ...compatible,
+    video: {
+      ...compatible.video,
+      bit_rate: String(media.constants.MAX_COMPATIBLE_BITRATE + 1)
+    }
+  }), false);
+  assert.equal(media.isSamsungVideoCompatible({
+    ...compatible,
+    video: { ...compatible.video, sample_aspect_ratio: '4:3' }
+  }), false);
+});
+
+test('normaliza vídeo anamórfico para pixels quadrados sem deformar a imagem', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'player-ffmpeg-test-'));
+  const input = path.join(dir, 'entrada-anamorfica.mp4');
+  const output = path.join(dir, 'saida-quadrada.mp4');
+
+  try {
+    await run([
+      '-y',
+      '-f', 'lavfi',
+      '-i', 'testsrc=size=720x480:rate=24',
+      '-t', '1',
+      '-vf', 'setsar=32/27',
+      '-c:v', 'libx264',
+      '-pix_fmt', 'yuv420p',
+      input
+    ]);
+
+    const inputInfo = await media.probe(input);
+    assert.equal(inputInfo.video.sample_aspect_ratio, '32:27');
+
+    const info = await media.transcodeVideo(input, {}, output);
+    const inputDisplayAspect = Number(inputInfo.video.display_aspect_ratio.split(':')[0]) /
+      Number(inputInfo.video.display_aspect_ratio.split(':')[1]);
+    const outputDisplayAspect = Number(info.video.display_aspect_ratio.split(':')[0]) /
+      Number(info.video.display_aspect_ratio.split(':')[1]);
+
+    assert.equal(info.video.sample_aspect_ratio, '1:1');
+    assert.ok(Math.abs(inputDisplayAspect - outputDisplayAspect) < 0.01);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

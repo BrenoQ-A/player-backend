@@ -86,6 +86,46 @@ test('expõe o resultado do progresso para o upload autenticado', async () => {
     const uploaded = await uploadResponse.json();
     assert.equal(uploaded.processing, 'transcoded');
 
+    const duplicateForm = new FormData();
+    duplicateForm.append(
+      'file',
+      new Blob([await fs.readFile(input)], { type: 'video/x-msvideo' }),
+      'entrada.avi'
+    );
+    const duplicateResponse = await fetch(baseUrl + '/api/media/upload', {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + token,
+        'X-Upload-ID': 'upload-duplicate-12345678'
+      },
+      body: duplicateForm
+    });
+    assert.equal(duplicateResponse.status, 200);
+    const duplicate = await duplicateResponse.json();
+    assert.equal(duplicate.processing, 'duplicate');
+    assert.equal(duplicate.duplicate, true);
+
+    const mediaResponse = await fetch(baseUrl + '/api/media', {
+      headers: { Authorization: 'Bearer ' + token }
+    });
+    const mediaData = await mediaResponse.json();
+    assert.equal(mediaData.media.length, 1);
+
+    const optimizeResponse = await fetch(
+      baseUrl + '/api/media/' + mediaData.media[0].id + '/optimize',
+      { method: 'POST', headers: { Authorization: 'Bearer ' + token } }
+    );
+    assert.equal(optimizeResponse.status, 200);
+    const optimized = await optimizeResponse.json();
+    assert.equal(optimized.processing, 'unchanged');
+
+    const deduplicateResponse = await fetch(baseUrl + '/api/media/deduplicate', {
+      method: 'POST', headers: { Authorization: 'Bearer ' + token }
+    });
+    assert.equal(deduplicateResponse.status, 200);
+    const deduplicated = await deduplicateResponse.json();
+    assert.equal(deduplicated.removedCount, 0);
+
     const progressResponse = await fetch(
       baseUrl + '/api/media/progress/' + uploadId,
       { headers: { Authorization: 'Bearer ' + token } }

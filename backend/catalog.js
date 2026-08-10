@@ -6,6 +6,36 @@ const PLAYLIST_KEY = 'playlist.json';
 const MUSIC_KEY = 'music-library.json';
 const CONFIG_KEY = 'config.json';
 
+function normalizedMediaName(item) {
+  return String(item && (item.originalName || item.name) || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase();
+}
+
+function legacyMediaSignature(item) {
+  const name = normalizedMediaName(item);
+  const size = Number(item && item.sizeBytes);
+  const duration = Number(item && item.durationSeconds);
+  if (!name || !Number.isFinite(size) || size <= 0 ||
+      !Number.isFinite(duration) || duration <= 0) {
+    return '';
+  }
+  return [String(item.type || 'video'), name, size, Math.round(duration * 1000)].join('|');
+}
+
+function findDuplicateMedia(items, candidate) {
+  const hash = String(candidate && candidate.contentHash || '');
+  const legacy = legacyMediaSignature(candidate);
+  return items.find((item) => {
+    if (candidate.id && item.id === candidate.id) { return false; }
+    const itemHash = String(item.contentHash || '');
+    if (hash && itemHash) { return hash === itemHash; }
+    return !!legacy && legacy === legacyMediaSignature(item);
+  }) || null;
+}
+
 function createCatalog(storage) {
   let mutationQueue = Promise.resolve();
 
@@ -42,9 +72,54 @@ function createCatalog(storage) {
         id: crypto.randomUUID(),
         createdAt: new Date().toISOString()
       }, item);
+      const duplicate = findDuplicateMedia(playlist.items, media);
+      if (duplicate) {
+        const error = new Error('Este conteúdo já está publicado na playlist.');
+        error.code = 'MEDIA_DUPLICATE';
+        error.media = duplicate;
+        throw error;
+      }
       playlist.items.push(media);
       await savePlaylist(playlist);
       return media;
+    });
+  }
+
+  async function replaceMedia(id, patch) {
+    return serialize(async () => {
+      const playlist = await getPlaylist();
+      const index = playlist.items.findIndex((item) => item.id === id);
+      if (index === -1) { return null; }
+      const previous = playlist.items[index];
+      const replacement = Object.assign({}, previous, patch, {
+        id: previous.id,
+        createdAt: previous.createdAt
+      });
+      playlist.items[index] = replacement;
+      await savePlaylist(playlist);
+      return { previous, media: replacement };
+    });
+  }
+
+  async function deduplicateMedia() {
+    return serialize(async () => {
+      const playlist = await getPlaylist();
+      const kept = [];
+      const removed = [];
+
+      playlist.items.forEach((item) => {
+        if (findDuplicateMedia(kept, item)) {
+          removed.push(item);
+        } else {
+          kept.push(item);
+        }
+      });
+
+      if (removed.length) {
+        playlist.items = kept;
+        await savePlaylist(playlist);
+      }
+      return { playlist, removed };
     });
   }
 
@@ -132,6 +207,8 @@ function createCatalog(storage) {
     keys: { PLAYLIST_KEY, MUSIC_KEY, CONFIG_KEY },
     getPlaylist,
     addMedia,
+    replaceMedia,
+    deduplicateMedia,
     removeMedia,
     reorderMedia,
     getMusicLibrary,

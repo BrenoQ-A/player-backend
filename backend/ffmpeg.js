@@ -10,12 +10,17 @@ const FFMPEG_THREADS = process.env.FFMPEG_THREADS || '1';
 const FFMPEG_PRESET = process.env.FFMPEG_PRESET || 'ultrafast';
 const MAX_WIDTH = Number(process.env.FFMPEG_MAX_WIDTH || 1280);
 const MAX_HEIGHT = Number(process.env.FFMPEG_MAX_HEIGHT || 720);
+const MAX_COMPATIBLE_BITRATE = Number(
+  process.env.FFMPEG_MAX_COMPATIBLE_BITRATE || 3500000
+);
 const VIDEO_FPS = process.env.FFMPEG_VIDEO_FPS || '30';
 const IMAGE_VIDEO_FPS = process.env.IMAGE_VIDEO_FPS || '15';
+const VIDEO_LEVEL = process.env.FFMPEG_VIDEO_LEVEL || '3.1';
 const MAX_CAPTURE_CHARS = 20000;
 const SCALE_FILTER =
-  "scale=w='min(" + MAX_WIDTH + ",iw)':h='min(" + MAX_HEIGHT + ",ih)':" +
-  'force_original_aspect_ratio=decrease:force_divisible_by=2';
+  "scale=w='trunc(oh*dar/2)*2':" +
+  "h='trunc(min(min(" + MAX_HEIGHT + ",ih),min(" +
+  MAX_WIDTH + ",iw*sar)/dar)/2)*2',setsar=1";
 
 const VIDEO_ARGS = [
   '-c:v', 'libx264',
@@ -23,7 +28,7 @@ const VIDEO_ARGS = [
   '-tune', 'zerolatency',
   '-crf', process.env.FFMPEG_CRF || '23',
   '-profile:v', 'main',
-  '-level:v', '4.0',
+  '-level:v', VIDEO_LEVEL,
   '-pix_fmt', 'yuv420p',
   '-threads', FFMPEG_THREADS,
   '-maxrate', process.env.FFMPEG_MAXRATE || '3M',
@@ -34,7 +39,7 @@ const VIDEO_ARGS = [
 
 const AUDIO_ARGS = [
   '-c:a', 'aac',
-  '-b:a', process.env.FFMPEG_AUDIO_BITRATE || '160k',
+  '-b:a', process.env.FFMPEG_AUDIO_BITRATE || '128k',
   '-ac', '2',
   '-ar', '48000'
 ];
@@ -116,7 +121,7 @@ async function probe(filePath) {
     '-v', 'error',
     '-show_entries', 'format=duration,size,bit_rate',
     '-show_entries',
-    'stream=codec_type,codec_name,profile,level,width,height,pix_fmt,r_frame_rate,avg_frame_rate,bit_rate,sample_rate,channels',
+    'stream=codec_type,codec_name,profile,level,width,height,sample_aspect_ratio,display_aspect_ratio,pix_fmt,r_frame_rate,avg_frame_rate,bit_rate,sample_rate,channels',
     '-of', 'json',
     filePath
   ]);
@@ -151,18 +156,22 @@ function isSamsungVideoCompatible(info) {
   const bitRate = Number(video.bit_rate) || Number(info.bitRate) ||
     (Number(info.sizeBytes) * 8 / Number(info.durationSeconds));
   const profile = String(video.profile || '');
+  const level = Number(video.level);
+  const sampleAspectRatio = String(video.sample_aspect_ratio || '');
 
   return (
     video.codec_name === 'h264' &&
-    /baseline|main|high/i.test(profile) &&
-    Number(video.level) <= 41 &&
-    Number(video.width) <= 1920 &&
-    Number(video.height) <= 1080 &&
+    /baseline|main/i.test(profile) &&
+    level > 0 &&
+    level <= 31 &&
+    Number(video.width) <= MAX_WIDTH &&
+    Number(video.height) <= MAX_HEIGHT &&
+    sampleAspectRatio === '1:1' &&
     video.pix_fmt === 'yuv420p' &&
     frameRate > 0 &&
     frameRate <= 30.01 &&
     bitRate > 0 &&
-    bitRate <= 30000000
+    bitRate <= MAX_COMPATIBLE_BITRATE
   );
 }
 
@@ -305,7 +314,9 @@ module.exports = {
     FFMPEG_PRESET,
     MAX_WIDTH,
     MAX_HEIGHT,
+    MAX_COMPATIBLE_BITRATE,
     VIDEO_FPS,
-    IMAGE_VIDEO_FPS
+    IMAGE_VIDEO_FPS,
+    VIDEO_LEVEL
   }
 };

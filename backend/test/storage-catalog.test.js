@@ -88,3 +88,87 @@ test('armazenamento rejeita chaves que escapam da pasta', async () => {
     await fs.rm(dir, { recursive: true, force: true });
   }
 });
+
+test('catálogo impede novos duplicados e limpa duplicados antigos', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'player-catalog-dedup-test-'));
+  try {
+    const storage = createStorage({
+      driver: 'local',
+      localDir: dir,
+      publicBaseUrl: 'https://media.example.test'
+    });
+    const catalog = createCatalog(storage);
+    const base = {
+      originalName: 'Campanha.mp4',
+      name: 'Campanha.mp4',
+      type: 'video',
+      sizeBytes: 123456,
+      durationSeconds: 30
+    };
+
+    const first = await catalog.addMedia({
+      ...base,
+      key: 'media/primeiro.mp4',
+      contentHash: 'hash-a'
+    });
+    await assert.rejects(
+      catalog.addMedia({
+        ...base,
+        key: 'media/duplicado.mp4',
+        contentHash: 'hash-a'
+      }),
+      (error) => error.code === 'MEDIA_DUPLICATE' && error.media.id === first.id
+    );
+
+    const playlist = await catalog.getPlaylist();
+    playlist.items.push({
+      ...base,
+      id: 'duplicado-legado',
+      key: 'media/duplicado-legado.mp4',
+      order: 2,
+      url: 'https://media.example.test/media/duplicado-legado.mp4'
+    });
+    await storage.putJson('playlist.json', playlist);
+
+    const result = await catalog.deduplicateMedia();
+    assert.equal(result.removed.length, 1);
+    assert.equal(result.removed[0].id, 'duplicado-legado');
+    assert.deepEqual(result.playlist.items.map((item) => item.id), [first.id]);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('catálogo substitui o arquivo preservando identidade e ordem', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'player-catalog-replace-test-'));
+  try {
+    const storage = createStorage({
+      driver: 'local',
+      localDir: dir,
+      publicBaseUrl: 'https://media.example.test'
+    });
+    const catalog = createCatalog(storage);
+    const first = await catalog.addMedia({
+      name: 'A.mp4',
+      originalName: 'A.mp4',
+      key: 'media/a.mp4',
+      type: 'video',
+      sizeBytes: 100,
+      durationSeconds: 10,
+      contentHash: 'antes'
+    });
+
+    const result = await catalog.replaceMedia(first.id, {
+      key: 'media/a-720p.mp4',
+      sizeBytes: 80,
+      contentHash: 'depois'
+    });
+    assert.equal(result.previous.key, 'media/a.mp4');
+    assert.equal(result.media.id, first.id);
+    assert.equal(result.media.order, 1);
+    assert.equal(result.media.key, 'media/a-720p.mp4');
+    assert.equal(result.media.url, 'https://media.example.test/media/a-720p.mp4');
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
