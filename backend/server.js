@@ -8,6 +8,7 @@ const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
+const { createReadStream } = require('fs');
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
@@ -266,6 +267,16 @@ async function removeUploadedFiles(files) {
   await Promise.all(list.map((file) => fs.unlink(file.path).catch(() => {})));
 }
 
+function sha256File(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const input = createReadStream(filePath);
+    input.on('error', reject);
+    input.on('data', (chunk) => { hash.update(chunk); });
+    input.on('end', () => { resolve(hash.digest('hex')); });
+  });
+}
+
 function createApp() {
   validateEnvironment();
 
@@ -490,6 +501,7 @@ function createApp() {
       );
     }
 
+    const contentHash = await sha256File(outputPath);
     const displayName = safeBaseName(originalFile.originalname) + '.mp4';
     const key = 'media/' + crypto.randomUUID() + '-' + displayName;
     await storage.putFile(
@@ -510,12 +522,98 @@ function createApp() {
         durationSeconds: outputInfo.durationSeconds,
         videoCodec: outputInfo.video && outputInfo.video.codec_name,
         audioCodec: outputInfo.audio && outputInfo.audio.codec_name,
+        contentHash,
         uploadedBy
       });
     } catch (error) {
       await storage.deleteObject(key).catch(() => {});
+      if (error.code === 'MEDIA_DUPLICATE' && error.media) {
+        return Object.assign({}, error.media, { duplicate: true });
+      }
       throw error;
     }
+  }
+
+  async function replaceVideoOutput(item, outputPath, outputInfo, optimizedBy) {
+    const stat = await fs.stat(outputPath);
+    if (stat.size > MAX_OUTPUT_MB * 1024 * 1024) {
+      throw new Error(
+        'O vídeo processado ficou acima do limite de ' + MAX_OUTPUT_MB + ' MB.'
+      );
+    }
+
+    const contentHash = await sha256File(outputPath);
+    const displayName = safeBaseName(item.originalName || item.name) + '.mp4';
+    const key = 'media/' + crypto.randomUUID() + '-' + displayName;
+    await storage.putFile(
+      key,
+      outputPath,
+      'video/mp4',
+      'public, max-age=3600'
+    );
+
+    try {
+      const result = await catalog.replaceMedia(item.id, {
+        name: displayName,
+        key,
+        sizeBytes: stat.size,
+        durationSeconds: outputInfo.durationSeconds,
+        videoCodec: outputInfo.video && outputInfo.video.codec_name,
+        audioCodec: outputInfo.audio && outputInfo.audio.codec_name,
+        contentHash,
+        optimizedAt: new Date().toISOString(),
+        optimizedBy
+      });
+      if (!result) {
+        throw new Error('A mídia deixou de existir durante a otimização.');
+      }
+      if (result.previous.key && result.previous.key !== key) {
+        await storage.deleteObject(result.previous.key).catch(() => {});
+      }
+      return result.media;
+    } catch (error) {
+      await storage.deleteObject(key).catch(() => {});
+      throw error;
+    }
+  }
+
+  async function optimizePublishedVideo(item, optimizedBy) {
+    return withTempDir(async (dir) => {
+      const inputPath = path.join(dir, 'input' + (path.extname(item.key) || '.mp4'));
+      const outputPath = path.join(dir, 'output.mp4');
+      const downloaded = await storage.getFile(item.key, inputPath);
+      if (!downloaded) {
+        throw new Error('O arquivo original não foi encontrado no armazenamento.');
+      }
+
+      const inputInfo = await ffmpeg.probe(inputPath);
+      const videoCompatible = ffmpeg.isSamsungVideoCompatible(inputInfo);
+      const audioCompatible = ffmpeg.isSamsungAudioCompatible(inputInfo);
+      const fastStart = videoCompatible && audioCompatible &&
+        await ffmpeg.hasFastStart(inputPath);
+      if (fastStart) {
+        return { media: item, processing: 'unchanged' };
+      }
+
+      let outputInfo;
+      let processing;
+      if (videoCompatible) {
+        processing = audioCompatible ? 'remuxed' : 'audio-transcoded';
+        outputInfo = await ffmpeg.remuxVideo(inputPath, {
+          inputInfo,
+          transcodeAudio: !audioCompatible
+        }, outputPath);
+      } else {
+        processing = 'transcoded';
+        outputInfo = await ffmpeg.transcodeVideo(inputPath, {
+          inputInfo,
+          keepOriginalAudio: true
+        }, outputPath);
+      }
+
+      const media = await replaceVideoOutput(item, outputPath, outputInfo, optimizedBy);
+      return { media, processing };
+    });
   }
 
   app.post(
@@ -641,17 +739,23 @@ function createApp() {
           }));
         }
 
+        if (media.duplicate) {
+          processing = 'duplicate';
+        }
         report({
           stage: 'complete',
           percent: 100,
           processing,
-          message: 'Vídeo publicado com sucesso.'
+          message: media.duplicate
+            ? 'Este vídeo já estava publicado; nenhuma cópia foi criada.'
+            : 'Vídeo publicado com sucesso.'
         });
         res.json({
           ok: true,
           media,
           name: media.name,
-          processing
+          processing,
+          duplicate: !!media.duplicate
         });
       } catch (error) {
         const uploadId = req.get('x-upload-id') || '';
@@ -670,6 +774,44 @@ function createApp() {
     const order = Array.isArray(req.body && req.body.order) ? req.body.order : [];
     const playlist = await catalog.reorderMedia(order);
     res.json({ ok: true, media: playlist.items });
+  }));
+
+  app.post('/api/media/deduplicate', requireAuth, asyncRoute(async (req, res) => {
+    const result = await catalog.deduplicateMedia();
+    const keptKeys = new Set(result.playlist.items.map((item) => item.key).filter(Boolean));
+    const deletionFailures = [];
+
+    await Promise.all(result.removed.map(async (item) => {
+      if (!item.key || keptKeys.has(item.key)) { return; }
+      try {
+        await storage.deleteObject(item.key);
+      } catch (error) {
+        deletionFailures.push(item.name || item.key);
+      }
+    }));
+
+    res.json({
+      ok: true,
+      removedCount: result.removed.length,
+      deletionFailures,
+      media: result.playlist.items
+    });
+  }));
+
+  app.post('/api/media/:id/optimize', requireAuth, asyncRoute(async (req, res) => {
+    const playlist = await catalog.getPlaylist();
+    const item = playlist.items.find((candidate) => candidate.id === req.params.id);
+    if (!item) {
+      return res.status(404).json({ error: 'Mídia não encontrada.' });
+    }
+    if (item.type !== 'video') {
+      return res.status(400).json({ error: 'A otimização aceita somente vídeos.' });
+    }
+
+    const result = await processingQueue.run(
+      () => optimizePublishedVideo(item, req.gpid)
+    );
+    res.json({ ok: true, media: result.media, processing: result.processing });
   }));
 
   app.delete('/api/media/:id', requireAuth, asyncRoute(async (req, res) => {
