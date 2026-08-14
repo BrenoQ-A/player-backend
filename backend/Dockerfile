@@ -1,13 +1,15 @@
-FROM node:20-slim
+FROM node:22-slim
 
 WORKDIR /app
 
+ENV NODE_ENV=production
+ENV PORT=8080
+
 COPY package*.json ./
-RUN npm install --production
+RUN npm ci --omit=dev && npm cache clean --force
 
 COPY . .
 
-ENV PORT=8080
 EXPOSE 8080
 
-CMD ["node", "index.js"]
+CMD ["node", "server.js"]
