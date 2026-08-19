@@ -7,11 +7,11 @@ const ffprobePath = require('ffprobe-static').path;
 
 const LOUDNESS_TARGET = 'loudnorm=I=-16:TP=-1.5:LRA=11';
 const FFMPEG_THREADS = process.env.FFMPEG_THREADS || '1';
-const FFMPEG_PRESET = process.env.FFMPEG_PRESET || 'ultrafast';
+const FFMPEG_PRESET = process.env.FFMPEG_PRESET || 'veryfast';
 const MAX_WIDTH = Number(process.env.FFMPEG_MAX_WIDTH || 1280);
 const MAX_HEIGHT = Number(process.env.FFMPEG_MAX_HEIGHT || 720);
 const MAX_COMPATIBLE_BITRATE = Number(
-  process.env.FFMPEG_MAX_COMPATIBLE_BITRATE || 3500000
+  process.env.FFMPEG_MAX_COMPATIBLE_BITRATE || 6000000
 );
 const VIDEO_FPS = process.env.FFMPEG_VIDEO_FPS || '30';
 const IMAGE_VIDEO_FPS = process.env.IMAGE_VIDEO_FPS || '15';
@@ -20,20 +20,18 @@ const MAX_CAPTURE_CHARS = 20000;
 const SCALE_FILTER =
   "scale=w='trunc(oh*dar/2)*2':" +
   "h='trunc(min(min(" + MAX_HEIGHT + ",ih),min(" +
-  MAX_WIDTH + ",iw*sar)/dar)/2)*2',setsar=1";
+  MAX_WIDTH + ",iw*sar)/dar)/2)*2':flags=lanczos,setsar=1";
 
 const VIDEO_ARGS = [
   '-c:v', 'libx264',
   '-preset', FFMPEG_PRESET,
-  '-tune', 'zerolatency',
-  '-crf', process.env.FFMPEG_CRF || '23',
+  '-crf', process.env.FFMPEG_CRF || '20',
   '-profile:v', 'main',
   '-level:v', VIDEO_LEVEL,
   '-pix_fmt', 'yuv420p',
   '-threads', FFMPEG_THREADS,
-  '-maxrate', process.env.FFMPEG_MAXRATE || '3M',
-  '-bufsize', process.env.FFMPEG_BUFSIZE || '6M',
-  '-x264-params', 'rc-lookahead=0:sync-lookahead=0:bframes=0:sliced-threads=1',
+  '-maxrate', process.env.FFMPEG_MAXRATE || '6M',
+  '-bufsize', process.env.FFMPEG_BUFSIZE || '12M',
   '-movflags', '+faststart'
 ];
 
