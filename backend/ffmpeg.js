@@ -8,26 +8,22 @@ const ffprobePath = require('ffprobe-static').path;
 const LOUDNESS_TARGET = 'loudnorm=I=-16:TP=-1.5:LRA=11';
 const FFMPEG_THREADS = process.env.FFMPEG_THREADS || '1';
 const FFMPEG_PRESET = process.env.FFMPEG_PRESET || 'veryfast';
-const MAX_WIDTH = Number(process.env.FFMPEG_MAX_WIDTH || 1280);
-const MAX_HEIGHT = Number(process.env.FFMPEG_MAX_HEIGHT || 720);
 const MAX_COMPATIBLE_BITRATE = Number(
   process.env.FFMPEG_MAX_COMPATIBLE_BITRATE || 6000000
 );
 const VIDEO_FPS = process.env.FFMPEG_VIDEO_FPS || '30';
 const IMAGE_VIDEO_FPS = process.env.IMAGE_VIDEO_FPS || '15';
-const VIDEO_LEVEL = process.env.FFMPEG_VIDEO_LEVEL || '3.1';
 const MAX_CAPTURE_CHARS = 20000;
-const SCALE_FILTER =
+const VIDEO_FILTER = 'setsar=1';
+const IMAGE_SCALE_FILTER =
   "scale=w='trunc(oh*dar/2)*2':" +
-  "h='trunc(min(min(" + MAX_HEIGHT + ",ih),min(" +
-  MAX_WIDTH + ",iw*sar)/dar)/2)*2':flags=lanczos,setsar=1";
+  "h='trunc(min(min(720,ih),min(1280,iw*sar)/dar)/2)*2':flags=lanczos,setsar=1";
 
 const VIDEO_ARGS = [
   '-c:v', 'libx264',
   '-preset', FFMPEG_PRESET,
   '-crf', process.env.FFMPEG_CRF || '20',
   '-profile:v', 'main',
-  '-level:v', VIDEO_LEVEL,
   '-pix_fmt', 'yuv420p',
   '-threads', FFMPEG_THREADS,
   '-maxrate', process.env.FFMPEG_MAXRATE || '6M',
@@ -154,16 +150,11 @@ function isSamsungVideoCompatible(info) {
   const bitRate = Number(video.bit_rate) || Number(info.bitRate) ||
     (Number(info.sizeBytes) * 8 / Number(info.durationSeconds));
   const profile = String(video.profile || '');
-  const level = Number(video.level);
   const sampleAspectRatio = String(video.sample_aspect_ratio || '');
 
   return (
     video.codec_name === 'h264' &&
     /baseline|main/i.test(profile) &&
-    level > 0 &&
-    level <= 31 &&
-    Number(video.width) <= MAX_WIDTH &&
-    Number(video.height) <= MAX_HEIGHT &&
     sampleAspectRatio === '1:1' &&
     video.pix_fmt === 'yuv420p' &&
     frameRate > 0 &&
@@ -199,8 +190,8 @@ async function hasFastStart(filePath) {
   }
 }
 
-function videoOutputArgs(frameRate) {
-  return ['-filter_threads', FFMPEG_THREADS, '-vf', SCALE_FILTER]
+function videoOutputArgs(frameRate, filter) {
+  return ['-filter_threads', FFMPEG_THREADS, '-vf', filter || VIDEO_FILTER]
     .concat(VIDEO_ARGS)
     .concat(['-r', String(frameRate || VIDEO_FPS)]);
 }
@@ -218,7 +209,7 @@ async function imageToVideo(imagePath, musicPath, durationSeconds, outPath, onPr
   }
 
   args.push('-t', String(durationSeconds));
-  args.push.apply(args, videoOutputArgs(IMAGE_VIDEO_FPS));
+  args.push.apply(args, videoOutputArgs(IMAGE_VIDEO_FPS, IMAGE_SCALE_FILTER));
 
   if (musicPath) {
     args.push('-map', '0:v:0', '-map', '1:a:0');
@@ -244,7 +235,7 @@ async function transcodeVideo(videoPath, options, outPath) {
   }
 
   args.push('-map', '0:v:0');
-  args.push.apply(args, videoOutputArgs(VIDEO_FPS));
+  args.push.apply(args, videoOutputArgs(VIDEO_FPS, VIDEO_FILTER));
 
   if (opts.keepOriginalAudio && inputInfo.audio) {
     args.push('-map', '0:a:0');
@@ -306,15 +297,13 @@ module.exports = {
   isSamsungCompatible,
   hasFastStart,
   constants: {
-    SCALE_FILTER,
+    VIDEO_FILTER,
+    IMAGE_SCALE_FILTER,
     VIDEO_ARGS,
     AUDIO_ARGS,
     FFMPEG_PRESET,
-    MAX_WIDTH,
-    MAX_HEIGHT,
     MAX_COMPATIBLE_BITRATE,
     VIDEO_FPS,
-    IMAGE_VIDEO_FPS,
-    VIDEO_LEVEL
+    IMAGE_VIDEO_FPS
   }
 };
