@@ -7,8 +7,8 @@
     "node": ">=22"
   },
   "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js && node --check storage.js && node --check catalog.js && node --check ffmpeg.js && node --check processing-queue.js && node --check progress-tracker.js && node --check youtube-audio.js && node --check password-reset.js",
+    "start": "node entrypoint.js",
+    "check": "node --check entrypoint.js && node --check staging.js && node --check server.js && node --check storage.js && node --check catalog.js && node --check ffmpeg.js && node --check processing-queue.js && node --check progress-tracker.js && node --check youtube-audio.js && node --check password-reset.js",
     "test": "node --test"
   },
   "dependencies": {
