@@ -40,3 +40,34 @@ jobs:
             ghcr.io/brenoq-a/player-backend:${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy immutable image to Azure Container Apps
+        run: |
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az containerapp update \
+            --name player-backend \
+            --resource-group rg-player-sinalizacao \
+            --image ghcr.io/brenoq-a/player-backend:${{ github.sha }}
+
+      - name: Verify backend health
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEALTH_URL='https://player-backend.ambitiouswave-c76e39f5.brazilsouth.azurecontainerapps.io/health'
+          for attempt in $(seq 1 12); do
+            status="$(curl --silent --show-error --output /tmp/health.json --write-out '%{http_code}' --max-time 15 "$HEALTH_URL" || true)"
+            if [ "$status" = '200' ]; then
+              cat /tmp/health.json
+              exit 0
+            fi
+            echo "Health check $attempt/12 retornou HTTP ${status:-erro}; aguardando nova revisão..."
+            sleep 10
+          done
+          echo 'A nova revisão não ficou saudável dentro de 2 minutos.' >&2
+          [ -f /tmp/health.json ] && cat /tmp/health.json >&2 || true
+          exit 1
