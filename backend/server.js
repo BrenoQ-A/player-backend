@@ -18,6 +18,7 @@ const gh = require('./github');
 const ffmpeg = require('./ffmpeg');
 const { createStorage } = require('./storage');
 const { createCatalog } = require('./catalog');
+const { createDeviceCatalog } = require('./devices');
 const { createProcessingQueue } = require('./processing-queue');
 const { createProgressTracker } = require('./progress-tracker');
 const { extractYouTubeAudio } = require('./youtube-audio');
@@ -282,6 +283,7 @@ function createApp() {
 
   const storage = createStorage();
   const catalog = createCatalog(storage);
+  const devices = createDeviceCatalog(storage, catalog);
   const processingQueue = createProcessingQueue({ maxPending: MAX_PROCESSING_QUEUE });
   const progressTracker = createProgressTracker();
   const app = express();
@@ -355,6 +357,61 @@ function createApp() {
     }
     res.json({ progress });
   });
+
+  app.get('/api/devices', requireAuth, asyncRoute(async (req, res) => {
+    const registry = await devices.getRegistry();
+    res.json({
+      devices: registry.devices,
+      updatedAt: registry.updatedAt,
+      devicesUrl: storage.publicUrl(devices.keys.DEVICES_KEY)
+    });
+  }));
+
+  app.post('/api/devices', requireAuth, requireAdmin, asyncRoute(async (req, res) => {
+    const device = await devices.addDevice(req.body || {});
+    res.status(201).json({ ok: true, device });
+  }));
+
+  app.put('/api/devices/:id', requireAuth, requireAdmin, asyncRoute(async (req, res) => {
+    const device = await devices.updateDevice(req.params.id, req.body || {});
+    if (!device) {
+      return res.status(404).json({ error: 'TV não encontrada.', code: 'DEVICE_NOT_FOUND' });
+    }
+    res.json({ ok: true, device });
+  }));
+
+  app.delete('/api/devices/:id', requireAuth, requireAdmin, asyncRoute(async (req, res) => {
+    const device = await devices.removeDevice(req.params.id);
+    if (!device) {
+      return res.status(404).json({ error: 'TV não encontrada.', code: 'DEVICE_NOT_FOUND' });
+    }
+    res.json({ ok: true, device });
+  }));
+
+  app.get('/api/devices/:id/playlist', requireAuth, asyncRoute(async (req, res) => {
+    const device = await devices.getDevice(req.params.id);
+    if (!device) {
+      return res.status(404).json({ error: 'TV não encontrada.', code: 'DEVICE_NOT_FOUND' });
+    }
+    const [playlist, general] = await Promise.all([
+      devices.getDevicePlaylist(device.id),
+      catalog.getPlaylist()
+    ]);
+    res.json({
+      device,
+      media: playlist.items,
+      availableMedia: general.items,
+      playlistUrl: storage.publicUrl(devices.playlistKey(device.id))
+    });
+  }));
+
+  app.put('/api/devices/:id/playlist', requireAuth, requireAdmin, asyncRoute(async (req, res) => {
+    const playlist = await devices.setDeviceMedia(req.params.id, req.body && req.body.mediaIds);
+    if (!playlist) {
+      return res.status(404).json({ error: 'TV não encontrada.', code: 'DEVICE_NOT_FOUND' });
+    }
+    res.json({ ok: true, media: playlist.items });
+  }));
 
   app.post('/api/auth/register', asyncRoute(async (req, res) => {
     const { gpid, password, inviteCode } = req.body || {};
@@ -567,6 +624,7 @@ function createApp() {
       if (!result) {
         throw new Error('A mídia deixou de existir durante a otimização.');
       }
+      await devices.replaceMediaReference(item.id, result.media);
       if (result.previous.key && result.previous.key !== key) {
         await storage.deleteObject(result.previous.key).catch(() => {});
       }
@@ -782,6 +840,7 @@ function createApp() {
     const deletionFailures = [];
 
     await Promise.all(result.removed.map(async (item) => {
+      await devices.removeMediaReference(item.id);
       if (!item.key || keptKeys.has(item.key)) { return; }
       try {
         await storage.deleteObject(item.key);
@@ -820,6 +879,7 @@ function createApp() {
     if (!item) {
       return res.status(404).json({ error: 'Mídia não encontrada.' });
     }
+    await devices.removeMediaReference(item.id);
     await storage.deleteObject(item.key);
     await catalog.removeMedia(item.id);
     res.json({ ok: true });
@@ -1037,7 +1097,7 @@ function createApp() {
     });
   });
 
-  return { app, storage, catalog };
+  return { app, storage, catalog, devices };
 }
 
 if (require.main === module) {
